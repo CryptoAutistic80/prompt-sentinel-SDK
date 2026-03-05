@@ -365,6 +365,7 @@ or via env bootstrap (`AUTH_API_KEYS` suffix `@tenant[/workspace]`). For bound c
 - Header spoofing cannot switch bound credentials across tenants/workspaces.
 
 For a production migration workflow, see [AUTH_MIGRATION_GUIDE.md](AUTH_MIGRATION_GUIDE.md).
+For production incident response on scope mismatches, see [AUTH_SCOPE_MISMATCH_RUNBOOK.md](AUTH_SCOPE_MISMATCH_RUNBOOK.md).
 
 Quota hooks are middleware-enforced and disabled by default:
 

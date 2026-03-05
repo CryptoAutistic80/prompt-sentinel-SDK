@@ -7,7 +7,7 @@ Execution Mode: Phase-by-phase production hardening
 
 ## Current Stage Outcome
 
-This stage advanced **Phase 2 credential migration readiness** by shipping a migration-planning toolpath (`/api/auth/keys/migration-plan`), adding recommendation logic for legacy unbound credentials, and publishing an operator migration guide for safe rotation to tenant/workspace-bound keys.
+This stage advanced **Phase 2 operational runbook readiness** by adding a production incident runbook for credential/OIDC/mTLS scope mismatches, including concrete detection, rollback controls, and tenant impact triage procedures.
 
 ### Completed to date in this phase
 
@@ -228,6 +228,13 @@ This stage advanced **Phase 2 credential migration readiness** by shipping a mig
 - Published operational migration guide:
   - `AUTH_MIGRATION_GUIDE.md`
   - step-by-step flow for evidence collection, plan generation, rotation, and release gating
+- Added scope-mismatch incident runbook:
+  - `AUTH_SCOPE_MISMATCH_RUNBOOK.md`
+  - detection queries via auth access-log + audit trail correlation
+  - auth-mechanism-specific containment/recovery flows (API key, OIDC, mTLS)
+  - staged rollback controls with trigger thresholds
+  - tenant impact triage checklist and post-incident actions
+- Linked runbook from README for operator discoverability.
 
 ## Phase Status Dashboard
 
@@ -235,7 +242,7 @@ This stage advanced **Phase 2 credential migration readiness** by shipping a mig
 |---|---|---|
 | Phase 0 - Foundation Hardening | In Progress | Core security/reliability foundations implemented; OTel/Sentry/chaos/contract testing remain. |
 | Phase 1 - Provider-Agnostic LLM Support | In Progress | Provider abstraction + backend switching implemented; routing/fallback/cost optimization pending. |
-| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + mTLS auth + durable auth access auditing + resource-level permission scaffold + tenant/workspace isolation baseline + first-pass tenant quota hooks + pluggable durable tenant quota backend (`memory`/`sled`) + tenant/workspace policy overlays + audit query isolation filters + audit residency metadata + runtime fail-closed residency checks + API-level adversarial isolation pentest suite + tenant/workspace-bound credential identity enforcement + OIDC/mTLS mixed-scope traversal tests + OIDC fail-closed scope precedence + credential migration planning endpoint/tooling + CI isolation gates implemented. |
+| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + mTLS auth + durable auth access auditing + resource-level permission scaffold + tenant/workspace isolation baseline + first-pass tenant quota hooks + pluggable durable tenant quota backend (`memory`/`sled`) + tenant/workspace policy overlays + audit query isolation filters + audit residency metadata + runtime fail-closed residency checks + API-level adversarial isolation pentest suite + tenant/workspace-bound credential identity enforcement + OIDC/mTLS mixed-scope traversal tests + OIDC fail-closed scope precedence + credential migration planning endpoint/tooling + operational mismatch runbooks + CI isolation gates implemented. |
 | Phase 3 - Comprehensive EU AI Act Coverage | In Progress | Baseline classification exists; full article-by-article depth pending. |
 | Phase 4 - Audit Trail & Evidence Management | In Progress | Existing audit trail and proofs active; v2 schema + advanced exports/retention lifecycle pending. |
 | Phase 5 - Configuration & Rules Management | In Progress | Env-driven config active; hot reload/staged rollout/rollback/policy-as-code pending. |
@@ -318,29 +325,26 @@ This stage advanced **Phase 2 credential migration readiness** by shipping a mig
   - OIDC explicit-scope precedence hardening (no role fallback when scopes are present).
   - Credential migration planning service and API endpoint for unbound->bound rotation rollout.
   - Operator migration guide for phased credential binding rollout (`AUTH_MIGRATION_GUIDE.md`).
+  - Operator incident runbook for credential/OIDC/mTLS scope mismatches (`AUTH_SCOPE_MISMATCH_RUNBOOK.md`).
   - Dedicated CI isolation/security regression workflow (`isolation-regressions.yml`).
 - Remaining:
-  - Add operational runbooks for OIDC/mTLS scope mismatch incidents and staged rollback controls.
   - Add release-gate automation that blocks production deploys with unapproved unbound credentials.
+  - Add CI policy assertions for migration-plan endpoint output (`unbound_credentials`) in pre-release environments.
 
 ## Validation
 
 Commands run for this stage:
 
-- `rustfmt --edition 2024 src/modules/auth/mod.rs src/server.rs` -> pass
-- `cargo test migration_plan_ -- --nocapture` -> pass
 - `cargo test` -> pass (all suites green; benchmark test intentionally ignored)
 
 ## Files Changed This Stage
 
-- `src/server.rs`
-- `src/modules/auth/mod.rs`
 - `README.md`
-- `AUTH_MIGRATION_GUIDE.md`
+- `AUTH_SCOPE_MISMATCH_RUNBOOK.md`
 - `PROGRESS_SUMMARY.md`
 
 ## Next Execution Slice
 
-1. Add operator runbooks for credential/OIDC/mTLS scope mismatch incidents (detection, rollback, tenant impact triage).
-2. Add release-gate checks that fail deployments with unapproved unbound credentials in production mode.
-3. Add CI policy assertions for migration-plan endpoint output (`unbound_credentials`) in pre-release environments.
+1. Add release-gate checks that fail deployments with unapproved unbound credentials in production mode.
+2. Add CI policy assertions for migration-plan endpoint output (`unbound_credentials`) in pre-release environments.
+3. Add a pre-release canary checklist that validates runbook alerts, rollback triggers, and on-call handoff quality.
