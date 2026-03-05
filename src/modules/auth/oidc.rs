@@ -1,10 +1,17 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
+use jsonwebtoken::{
+    Algorithm, DecodingKey, Validation, decode, decode_header,
+    errors::{Error as JwtError, ErrorKind as JwtErrorKind},
+};
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
+use tracing::warn;
 
 use crate::config::settings::AppSettings;
 
@@ -47,6 +54,36 @@ pub struct OidcVerifierConfig {
     pub client_id: Option<String>,
     pub scopes_claim: String,
     pub roles_claim: String,
+    pub jwks_url: Option<String>,
+    pub jwks_refresh_interval_secs: u64,
+    pub clock_skew_secs: u64,
+}
+
+impl OidcVerifierConfig {
+    fn expected_audiences(&self) -> Vec<String> {
+        let mut audiences = Vec::new();
+
+        if let Some(value) = self
+            .audience
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            audiences.push(value.to_owned());
+        }
+
+        if let Some(value) = self
+            .client_id
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            && !audiences.iter().any(|existing| existing == value)
+        {
+            audiences.push(value.to_owned());
+        }
+
+        audiences
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -80,8 +117,16 @@ pub enum OidcVerificationError {
     NotJwt,
     #[error("token payload is invalid")]
     InvalidPayload,
+    #[error("token algorithm is unsupported: {0}")]
+    UnsupportedAlgorithm(String),
+    #[error("token signature is invalid")]
+    InvalidSignature,
     #[error("required subject claim is missing")]
     MissingSubject,
+    #[error("JWT header is missing key id")]
+    MissingKeyId,
+    #[error("no matching JWKS signing key found")]
+    SigningKeyNotFound,
     #[error("issuer mismatch")]
     IssuerMismatch,
     #[error("audience mismatch")]
@@ -130,28 +175,13 @@ impl OidcTokenVerifier for InsecureJwtClaimVerifier {
             }
         }
 
-        if let Some(expected_audience) = self
-            .config
-            .audience
-            .as_ref()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-        {
+        let expected_audiences = self.config.expected_audiences();
+        if !expected_audiences.is_empty() {
             let audiences = payload.audience_values();
-            if !audiences.iter().any(|aud| aud == expected_audience) {
-                return Err(OidcVerificationError::AudienceMismatch);
-            }
-        }
-
-        if let Some(expected_client_id) = self
-            .config
-            .client_id
-            .as_ref()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-        {
-            let audiences = payload.audience_values();
-            if !audiences.iter().any(|aud| aud == expected_client_id) {
+            if !expected_audiences
+                .iter()
+                .any(|expected| audiences.iter().any(|audience| audience == expected))
+            {
                 return Err(OidcVerificationError::AudienceMismatch);
             }
         }
@@ -170,10 +200,105 @@ impl OidcTokenVerifier for InsecureJwtClaimVerifier {
 
         let scopes = payload.claim_as_scopes(&self.config.scopes_claim);
         let roles = payload.claim_as_list(&self.config.roles_claim);
-
-        let tenant_id = payload.tenant_id();
         let issuer = payload.iss.clone();
         let email = payload.email.clone();
+        let tenant_id = payload.tenant_id();
+
+        Ok(OidcPrincipal {
+            subject,
+            issuer,
+            email,
+            tenant_id,
+            provider: self.config.provider.clone(),
+            roles,
+            scopes,
+        })
+    }
+
+    fn provider(&self) -> OidcProvider {
+        self.config.provider.clone()
+    }
+}
+
+#[derive(Clone)]
+pub struct JwksJwtVerifier {
+    config: OidcVerifierConfig,
+    cache: Arc<JwksCache>,
+}
+
+impl JwksJwtVerifier {
+    pub fn new(config: OidcVerifierConfig) -> Result<Self, String> {
+        let jwks_url = config
+            .jwks_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "OIDC_JWKS_URL is required for secure OIDC verification".to_string())?;
+
+        let refresh_interval = Duration::from_secs(config.jwks_refresh_interval_secs.max(30));
+        let cache = Arc::new(JwksCache::new(jwks_url.to_owned(), refresh_interval)?);
+        cache
+            .refresh(true)
+            .map_err(|error| format!("failed to initialize JWKS cache: {error}"))?;
+        Ok(Self { config, cache })
+    }
+}
+
+impl OidcTokenVerifier for JwksJwtVerifier {
+    fn verify(&self, token: &str) -> Result<OidcPrincipal, OidcVerificationError> {
+        let header = decode_header(token).map_err(map_jwt_header_error)?;
+        let algorithm = header.alg;
+        if !matches!(
+            algorithm,
+            Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512
+        ) {
+            return Err(OidcVerificationError::UnsupportedAlgorithm(format!(
+                "{algorithm:?}"
+            )));
+        }
+
+        let kid = header.kid.ok_or(OidcVerificationError::MissingKeyId)?;
+        let key = self.cache.key_for_kid(&kid)?;
+
+        let mut validation = Validation::new(algorithm);
+        validation.validate_nbf = true;
+        validation.leeway = self.config.clock_skew_secs;
+        validation
+            .required_spec_claims
+            .extend(["exp".to_string(), "sub".to_string()]);
+
+        if let Some(expected_issuer) = self
+            .config
+            .issuer
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            validation.set_issuer(&[expected_issuer.to_owned()]);
+        }
+
+        let expected_audiences = self.config.expected_audiences();
+        if !expected_audiences.is_empty() {
+            validation.set_audience(&expected_audiences);
+        }
+
+        let token_data =
+            decode::<JwtClaims>(token, key.as_ref(), &validation).map_err(map_jwt_decode_error)?;
+        let claims = token_data.claims;
+
+        let subject = claims
+            .sub
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or(OidcVerificationError::MissingSubject)?;
+
+        let scopes = claims.claim_as_scopes(&self.config.scopes_claim);
+        let roles = claims.claim_as_list(&self.config.roles_claim);
+        let issuer = claims.iss.clone();
+        let email = claims.email.clone();
+        let tenant_id = claims.tenant_id();
 
         Ok(OidcPrincipal {
             subject,
@@ -194,19 +319,18 @@ impl OidcTokenVerifier for InsecureJwtClaimVerifier {
 #[derive(Clone)]
 pub struct DisabledOidcVerifier {
     provider: OidcProvider,
+    reason: String,
 }
 
 impl DisabledOidcVerifier {
-    pub fn new(provider: OidcProvider) -> Self {
-        Self { provider }
+    pub fn new(provider: OidcProvider, reason: String) -> Self {
+        Self { provider, reason }
     }
 }
 
 impl OidcTokenVerifier for DisabledOidcVerifier {
     fn verify(&self, _token: &str) -> Result<OidcPrincipal, OidcVerificationError> {
-        Err(OidcVerificationError::Unavailable(
-            "no active OIDC verifier configured".to_string(),
-        ))
+        Err(OidcVerificationError::Unavailable(self.reason.clone()))
     }
 
     fn provider(&self) -> OidcProvider {
@@ -222,19 +346,201 @@ pub fn build_oidc_verifier(
     }
 
     let provider = OidcProvider::from_config(&settings.oidc_provider);
+    let config = OidcVerifierConfig {
+        provider: provider.clone(),
+        issuer: settings.oidc_issuer_url.clone(),
+        audience: settings.oidc_audience.clone(),
+        client_id: settings.oidc_client_id.clone(),
+        scopes_claim: settings.oidc_scopes_claim.clone(),
+        roles_claim: settings.oidc_roles_claim.clone(),
+        jwks_url: settings.oidc_jwks_url.clone(),
+        jwks_refresh_interval_secs: settings.oidc_jwks_refresh_interval_secs,
+        clock_skew_secs: settings.oidc_clock_skew_secs,
+    };
+
     if settings.oidc_allow_insecure_jwt_parse {
-        let config = OidcVerifierConfig {
-            provider,
-            issuer: settings.oidc_issuer_url.clone(),
-            audience: settings.oidc_audience.clone(),
-            client_id: settings.oidc_client_id.clone(),
-            scopes_claim: settings.oidc_scopes_claim.clone(),
-            roles_claim: settings.oidc_roles_claim.clone(),
-        };
-        Some(Arc::new(InsecureJwtClaimVerifier::new(config)))
-    } else {
-        Some(Arc::new(DisabledOidcVerifier::new(provider)))
+        warn!(
+            "OIDC insecure claim parsing is enabled; signature verification is bypassed (development-only)"
+        );
+        return Some(Arc::new(InsecureJwtClaimVerifier::new(config)));
     }
+
+    match JwksJwtVerifier::new(config) {
+        Ok(verifier) => Some(Arc::new(verifier)),
+        Err(error) => {
+            warn!("Secure OIDC verifier initialization failed: {error}");
+            Some(Arc::new(DisabledOidcVerifier::new(provider, error)))
+        }
+    }
+}
+
+struct JwksCacheState {
+    keys: HashMap<String, Arc<DecodingKey>>,
+    last_refresh: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct JwksCache {
+    jwks_url: String,
+    refresh_interval: Duration,
+    http_client: reqwest::blocking::Client,
+    state: Arc<Mutex<JwksCacheState>>,
+}
+
+impl JwksCache {
+    fn new(jwks_url: String, refresh_interval: Duration) -> Result<Self, String> {
+        let http_client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .map_err(|error| format!("failed to build JWKS HTTP client: {error}"))?;
+
+        Ok(Self {
+            jwks_url,
+            refresh_interval,
+            http_client,
+            state: Arc::new(Mutex::new(JwksCacheState {
+                keys: HashMap::new(),
+                last_refresh: None,
+            })),
+        })
+    }
+
+    fn key_for_kid(&self, kid: &str) -> Result<Arc<DecodingKey>, OidcVerificationError> {
+        self.refresh(false)?;
+        if let Some(key) = self.lookup_key(kid)? {
+            return Ok(key);
+        }
+
+        self.refresh(true)?;
+        self.lookup_key(kid)?
+            .ok_or(OidcVerificationError::SigningKeyNotFound)
+    }
+
+    fn lookup_key(&self, kid: &str) -> Result<Option<Arc<DecodingKey>>, OidcVerificationError> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| OidcVerificationError::Unavailable("JWKS cache lock poisoned".into()))?;
+        Ok(guard.keys.get(kid).cloned())
+    }
+
+    fn refresh(&self, force: bool) -> Result<(), OidcVerificationError> {
+        let should_refresh = {
+            let guard = self.state.lock().map_err(|_| {
+                OidcVerificationError::Unavailable("JWKS cache lock poisoned".into())
+            })?;
+            let stale = guard
+                .last_refresh
+                .is_none_or(|last_refresh| last_refresh.elapsed() >= self.refresh_interval);
+            force || stale || guard.keys.is_empty()
+        };
+
+        if !should_refresh {
+            return Ok(());
+        }
+
+        let fetched = fetch_jwks(&self.http_client, &self.jwks_url)?;
+
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| OidcVerificationError::Unavailable("JWKS cache lock poisoned".into()))?;
+        guard.keys = fetched;
+        guard.last_refresh = Some(Instant::now());
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct JwksDocument {
+    keys: Vec<JwksKey>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JwksKey {
+    kid: Option<String>,
+    kty: Option<String>,
+    alg: Option<String>,
+    #[serde(rename = "use")]
+    use_field: Option<String>,
+    n: Option<String>,
+    e: Option<String>,
+}
+
+fn fetch_jwks(
+    client: &reqwest::blocking::Client,
+    jwks_url: &str,
+) -> Result<HashMap<String, Arc<DecodingKey>>, OidcVerificationError> {
+    let response = client.get(jwks_url).send().map_err(|error| {
+        OidcVerificationError::Unavailable(format!("JWKS request failed: {error}"))
+    })?;
+
+    let response = response.error_for_status().map_err(|error| {
+        OidcVerificationError::Unavailable(format!("JWKS endpoint returned error: {error}"))
+    })?;
+
+    let document = response.json::<JwksDocument>().map_err(|error| {
+        OidcVerificationError::Unavailable(format!("invalid JWKS payload: {error}"))
+    })?;
+
+    let mut keys = HashMap::new();
+    for key in document.keys {
+        if !matches!(key.kty.as_deref(), Some("RSA")) {
+            continue;
+        }
+        if let Some(use_field) = key.use_field.as_deref()
+            && use_field != "sig"
+        {
+            continue;
+        }
+        if let Some(alg) = key.alg.as_deref()
+            && !matches!(alg, "RS256" | "RS384" | "RS512")
+        {
+            continue;
+        }
+
+        let Some(kid) = key
+            .kid
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(n) = key
+            .n
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(e) = key
+            .e
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+
+        match DecodingKey::from_rsa_components(n, e) {
+            Ok(decoding_key) => {
+                keys.insert(kid.to_owned(), Arc::new(decoding_key));
+            }
+            Err(error) => {
+                warn!("Skipping invalid JWKS RSA key for kid `{kid}`: {error}");
+            }
+        }
+    }
+
+    if keys.is_empty() {
+        return Err(OidcVerificationError::Unavailable(
+            "JWKS did not contain supported RSA signing keys".to_string(),
+        ));
+    }
+
+    Ok(keys)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -330,6 +636,32 @@ fn decode_jwt_claims(token: &str) -> Result<JwtClaims, OidcVerificationError> {
     serde_json::from_slice::<JwtClaims>(&bytes).map_err(|_| OidcVerificationError::InvalidPayload)
 }
 
+fn map_jwt_header_error(error: JwtError) -> OidcVerificationError {
+    match error.kind() {
+        JwtErrorKind::InvalidAlgorithm => {
+            OidcVerificationError::UnsupportedAlgorithm("invalid JWT algorithm".to_string())
+        }
+        _ => OidcVerificationError::NotJwt,
+    }
+}
+
+fn map_jwt_decode_error(error: JwtError) -> OidcVerificationError {
+    match error.kind() {
+        JwtErrorKind::InvalidSignature => OidcVerificationError::InvalidSignature,
+        JwtErrorKind::ExpiredSignature => OidcVerificationError::Expired,
+        JwtErrorKind::ImmatureSignature => OidcVerificationError::NotYetValid,
+        JwtErrorKind::InvalidAudience => OidcVerificationError::AudienceMismatch,
+        JwtErrorKind::InvalidIssuer => OidcVerificationError::IssuerMismatch,
+        JwtErrorKind::MissingRequiredClaim(claim) if claim == "sub" => {
+            OidcVerificationError::MissingSubject
+        }
+        JwtErrorKind::InvalidAlgorithm => {
+            OidcVerificationError::UnsupportedAlgorithm("invalid JWT algorithm".to_string())
+        }
+        _ => OidcVerificationError::InvalidPayload,
+    }
+}
+
 pub fn looks_like_jwt(token: &str) -> bool {
     token.split('.').count() == 3
 }
@@ -356,6 +688,9 @@ mod tests {
             client_id: None,
             scopes_claim: "scope".to_string(),
             roles_claim: "roles".to_string(),
+            jwks_url: None,
+            jwks_refresh_interval_secs: 300,
+            clock_skew_secs: 60,
         });
 
         let token = build_jwt(json!({
@@ -385,6 +720,9 @@ mod tests {
             client_id: None,
             scopes_claim: "scope".to_string(),
             roles_claim: "roles".to_string(),
+            jwks_url: None,
+            jwks_refresh_interval_secs: 300,
+            clock_skew_secs: 60,
         });
 
         let token = build_jwt(json!({
@@ -394,6 +732,43 @@ mod tests {
 
         let result = verifier.verify(&token);
         assert!(matches!(result, Err(OidcVerificationError::Expired)));
+    }
+
+    #[test]
+    fn secure_verifier_requires_jwks_url() {
+        let result = JwksJwtVerifier::new(OidcVerifierConfig {
+            provider: OidcProvider::Generic,
+            issuer: None,
+            audience: None,
+            client_id: None,
+            scopes_claim: "scope".to_string(),
+            roles_claim: "roles".to_string(),
+            jwks_url: None,
+            jwks_refresh_interval_secs: 300,
+            clock_skew_secs: 60,
+        });
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn expected_audience_list_deduplicates_values() {
+        let config = OidcVerifierConfig {
+            provider: OidcProvider::Generic,
+            issuer: None,
+            audience: Some("prompt-sentinel".to_string()),
+            client_id: Some("prompt-sentinel".to_string()),
+            scopes_claim: "scope".to_string(),
+            roles_claim: "roles".to_string(),
+            jwks_url: None,
+            jwks_refresh_interval_secs: 300,
+            clock_skew_secs: 60,
+        };
+
+        assert_eq!(
+            config.expected_audiences(),
+            vec!["prompt-sentinel".to_string()]
+        );
     }
 
     fn build_jwt(claims: Value) -> String {

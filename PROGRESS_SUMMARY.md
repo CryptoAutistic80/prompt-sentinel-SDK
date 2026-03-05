@@ -7,7 +7,7 @@ Execution Mode: Phase-by-phase production hardening
 
 ## Current Stage Outcome
 
-This stage advanced **Phase 2 OAuth/OIDC abstraction bootstrap** on top of the existing key lifecycle hardening.
+This stage advanced **Phase 2 OAuth/OIDC signature-validation hardening** on top of the existing auth lifecycle work.
 
 ### Completed in this stage
 
@@ -23,6 +23,8 @@ This stage advanced **Phase 2 OAuth/OIDC abstraction bootstrap** on top of the e
   - verifier trait + principal model for bearer-token auth
   - OIDC verifier builder wired from environment settings
 - Added OIDC bearer auth path in middleware-aligned auth flow while preserving API-key compatibility.
+- Added production-mode JWT validation against JWKS signing keys (RS256/RS384/RS512) with strict key-id based lookup.
+- Added in-memory JWKS cache with refresh interval support and key rotation handling.
 - Added OIDC bootstrap settings:
   - `OIDC_ENABLED`
   - `OIDC_PROVIDER`
@@ -31,6 +33,9 @@ This stage advanced **Phase 2 OAuth/OIDC abstraction bootstrap** on top of the e
   - `OIDC_CLIENT_ID`
   - `OIDC_ROLES_CLAIM`
   - `OIDC_SCOPES_CLAIM`
+  - `OIDC_JWKS_URL`
+  - `OIDC_JWKS_REFRESH_INTERVAL_SECS`
+  - `OIDC_CLOCK_SKEW_SECS`
   - `OIDC_ALLOW_INSECURE_JWT_PARSE` (dev-only guardrail)
 - Added credential metadata state fields:
   - `expires_at`
@@ -57,7 +62,7 @@ This stage advanced **Phase 2 OAuth/OIDC abstraction bootstrap** on top of the e
 |---|---|---|
 | Phase 0 - Foundation Hardening | In Progress | Core security/reliability foundations implemented; OTel/Sentry/chaos/contract testing remain. |
 | Phase 1 - Provider-Agnostic LLM Support | In Progress | Provider abstraction + backend switching implemented; routing/fallback/cost optimization pending. |
-| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC abstraction bootstrap implemented; full OAuth/OIDC validation/mTLS/multi-tenant isolation pending. |
+| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation implemented; provider-specific onboarding/mTLS/multi-tenant isolation pending. |
 | Phase 3 - Comprehensive EU AI Act Coverage | In Progress | Baseline classification exists; full article-by-article depth pending. |
 | Phase 4 - Audit Trail & Evidence Management | In Progress | Existing audit trail and proofs active; v2 schema + advanced exports/retention lifecycle pending. |
 | Phase 5 - Configuration & Rules Management | In Progress | Env-driven config active; hot reload/staged rollout/rollback/policy-as-code pending. |
@@ -112,10 +117,10 @@ This stage advanced **Phase 2 OAuth/OIDC abstraction bootstrap** on top of the e
   - Runtime credential generation/rotation/revoke/expire workflows.
   - Credential expiry + revoke enforcement at auth middleware boundary.
   - Persistent file-backed auth key store.
-  - OIDC provider abstraction + bearer-token auth integration scaffolding.
+  - OIDC provider abstraction + bearer-token auth integration.
+  - JWT signature verification via JWKS with refreshable key cache.
   - Auth access log retrieval.
 - Remaining:
-  - Production-grade OAuth 2.0 / OIDC JWT signature validation and JWKS refresh.
   - Provider-specific setup flows (Auth0/Okta/Azure AD/Keycloak).
   - mTLS auth support.
   - Resource-level permissions.
@@ -137,12 +142,14 @@ Commands run for this stage:
 - `src/config/settings.rs`
 - `src/server.rs`
 - `tests/multilingual_response_test.rs`
+- `Cargo.toml`
+- `Cargo.lock`
 - `.env.example`
 - `README.md`
 - `PROGRESS_SUMMARY.md`
 
 ## Next Execution Slice
 
-1. Replace dev-only OIDC claims parsing with production JWT signature validation + JWKS cache/rotation.
-2. Persist auth access audit events into the main audit evidence layer (durable and queryable).
-3. Introduce resource-level permissions scaffold (project/environment dimension) as the first multi-tenant control.
+1. Persist auth access audit events into the main audit evidence layer (durable and queryable).
+2. Introduce resource-level permissions scaffold (project/environment dimension) as the first multi-tenant control.
+3. Add provider-specific OIDC onboarding profiles (Auth0/Okta/Azure AD/Keycloak) with tested claim mappings.

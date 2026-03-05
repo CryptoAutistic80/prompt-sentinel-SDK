@@ -103,6 +103,9 @@ docker run -d \
 | `OIDC_CLIENT_ID` | Expected client id audience match | None |
 | `OIDC_ROLES_CLAIM` | JWT claim containing role list | `roles` |
 | `OIDC_SCOPES_CLAIM` | JWT claim containing scopes | `scope` |
+| `OIDC_JWKS_URL` | OIDC JWKS endpoint for JWT signature verification | None |
+| `OIDC_JWKS_REFRESH_INTERVAL_SECS` | JWKS cache refresh interval | `300` |
+| `OIDC_CLOCK_SKEW_SECS` | JWT clock skew tolerance | `60` |
 | `OIDC_ALLOW_INSECURE_JWT_PARSE` | Dev-only claim parsing without signature verification | `false` |
 | `RUST_LOG` | Logging level | `info` |
 | `SERVER_PORT` | Server port | `3000` |
@@ -246,7 +249,8 @@ List current auth credential metadata (token values are never returned).
 ### OIDC Bearer Auth (Bootstrap)
 
 When `OIDC_ENABLED=true`, `Authorization: Bearer <jwt>` requests are evaluated through the OIDC verifier abstraction (`generic` / `auth0` / `okta` / `azure_ad` / `keycloak` provider configs).  
-This stage includes the pluggable interface and a development-only claims parser gated behind `OIDC_ALLOW_INSECURE_JWT_PARSE=true`; production-grade signature validation is the next slice.
+Secure mode validates JWT signatures against `OIDC_JWKS_URL` with an in-memory JWKS cache (`OIDC_JWKS_REFRESH_INTERVAL_SECS`) and clock-skew tolerance (`OIDC_CLOCK_SKEW_SECS`).  
+`OIDC_ALLOW_INSECURE_JWT_PARSE=true` is development-only and bypasses signature checks.
 
 ### POST /api/auth/keys/generate
 

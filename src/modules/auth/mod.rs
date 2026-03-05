@@ -625,6 +625,10 @@ impl AuthService {
                 OidcVerificationError::NotYetValid
                 | OidcVerificationError::NotJwt
                 | OidcVerificationError::MissingSubject
+                | OidcVerificationError::MissingKeyId
+                | OidcVerificationError::SigningKeyNotFound
+                | OidcVerificationError::UnsupportedAlgorithm(_)
+                | OidcVerificationError::InvalidSignature
                 | OidcVerificationError::IssuerMismatch
                 | OidcVerificationError::AudienceMismatch
                 | OidcVerificationError::InvalidPayload => AuthError::InvalidCredentials,
@@ -1434,6 +1438,9 @@ mod tests {
             oidc_client_id: None,
             oidc_roles_claim: "roles".to_string(),
             oidc_scopes_claim: "scope".to_string(),
+            oidc_jwks_url: None,
+            oidc_jwks_refresh_interval_secs: 300,
+            oidc_clock_skew_secs: 60,
             oidc_allow_insecure_jwt_parse: false,
             bias_threshold: 0.35,
             max_input_length: 1024,
