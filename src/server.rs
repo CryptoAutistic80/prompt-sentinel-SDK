@@ -745,6 +745,10 @@ impl PromptSentinelServer {
             .route("/api/llm/health", get(llm_health_check))
             .route("/v1/models", get(validate_models))
             .route("/api/auth/keys", get(list_auth_keys))
+            .route(
+                "/api/auth/keys/migration-plan",
+                get(get_auth_key_migration_plan),
+            )
             .route("/api/auth/keys/generate", post(generate_auth_key))
             .route("/api/auth/keys/rotate", post(rotate_auth_key))
             .route("/api/auth/keys/revoke", post(revoke_auth_key))
@@ -930,6 +934,11 @@ struct AuthAccessLogQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct AuthMigrationPlanQuery {
+    observation_limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RotateAuthKeyRequest {
     old_token: String,
     new_token: String,
@@ -1063,6 +1072,21 @@ async fn get_auth_access_log(
     Ok(Json(serde_json::json!({
         "count": events.len(),
         "events": events,
+    })))
+}
+
+async fn get_auth_key_migration_plan(
+    State(state): State<AppState>,
+    Query(query): Query<AuthMigrationPlanQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let plan = state
+        .auth_service
+        .credential_migration_plan(query.observation_limit)
+        .map_err(map_auth_admin_error)?;
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "plan": plan,
     })))
 }
 
@@ -2221,6 +2245,53 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn auth_migration_plan_endpoint_recommends_binding_for_unbound_key() {
+        let settings = pentest_settings("migration-admin", vec!["auth:read", "audit:read"]);
+        let app = build_test_router(settings, None);
+
+        let audit_response = send_post(
+            &app,
+            "/api/audit/trail",
+            &[
+                ("x-api-key", "migration-admin"),
+                ("x-tenant-id", "tenant-a"),
+                ("x-workspace-id", "workspace-prod"),
+            ],
+            serde_json::json!({
+                "limit": 10,
+                "offset": 0
+            }),
+        )
+        .await;
+        assert_eq!(audit_response.status(), StatusCode::OK);
+
+        let plan_response = send_get(
+            &app,
+            "/api/auth/keys/migration-plan?observation_limit=5",
+            &[
+                ("x-api-key", "migration-admin"),
+                ("x-tenant-id", "tenant-a"),
+                ("x-workspace-id", "workspace-prod"),
+            ],
+        )
+        .await;
+        assert_eq!(plan_response.status(), StatusCode::OK);
+
+        let body = response_body_text(plan_response).await;
+        let payload: serde_json::Value = serde_json::from_str(&body).expect("valid json response");
+        assert_eq!(payload["status"], "ok");
+        assert_eq!(payload["plan"]["unbound_credentials"], 1);
+        assert_eq!(
+            payload["plan"]["suggestions"][0]["recommended_tenant_id"],
+            "tenant-a"
+        );
+        assert_eq!(
+            payload["plan"]["suggestions"][0]["recommended_workspace_id"],
+            "workspace-prod"
+        );
+    }
+
     fn test_auth_context(tenant_id: Option<&str>, workspace_id: Option<&str>) -> AuthContext {
         AuthContext {
             principal_id: "principal".to_string(),
@@ -2385,6 +2456,25 @@ mod tests {
                 serde_json::to_vec(&payload).expect("request payload should encode"),
             ))
             .expect("request should build");
+
+        app.clone()
+            .oneshot(request)
+            .await
+            .expect("router should respond")
+    }
+
+    async fn send_get(
+        app: &Router,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        let mut builder = Request::builder().method("GET").uri(path);
+
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+
+        let request = builder.body(Body::empty()).expect("request should build");
 
         app.clone()
             .oneshot(request)

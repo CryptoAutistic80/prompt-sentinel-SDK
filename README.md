@@ -276,6 +276,21 @@ Check LLM provider integration health.
 
 List current auth credential metadata (token values are never returned).
 
+### GET /api/auth/keys/migration-plan
+
+Generate a migration plan for legacy unbound credentials using observed allow events.
+
+Query params:
+
+- `observation_limit` (optional, default `5`, max `20`): max observed tenant/workspace pairs per credential.
+
+The response includes:
+
+- `plan.unbound_credentials`
+- per-key `requires_migration`
+- optional `recommended_tenant_id` / `recommended_workspace_id`
+- recommendation reasons (`single_observed_scope`, `ambiguous_observations`, `insufficient_observations`)
+
 ### OIDC Bearer Auth (Bootstrap)
 
 When `OIDC_ENABLED=true`, `Authorization: Bearer <jwt>` requests are evaluated through the OIDC verifier abstraction (`generic` / `auth0` / `okta` / `azure_ad` / `keycloak` provider configs).  
@@ -348,6 +363,8 @@ or via env bootstrap (`AUTH_API_KEYS` suffix `@tenant[/workspace]`). For bound c
 - Missing tenant/workspace headers are auto-resolved from the credential binding.
 - Header values that conflict with credential binding are denied.
 - Header spoofing cannot switch bound credentials across tenants/workspaces.
+
+For a production migration workflow, see [AUTH_MIGRATION_GUIDE.md](AUTH_MIGRATION_GUIDE.md).
 
 Quota hooks are middleware-enforced and disabled by default:
 

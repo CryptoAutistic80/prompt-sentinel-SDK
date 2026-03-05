@@ -466,6 +466,38 @@ pub struct AccessAuditEvent {
     pub detail: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct TenantScopeObservation {
+    pub tenant_id: String,
+    pub workspace_id: Option<String>,
+    pub allow_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CredentialMigrationSuggestion {
+    pub key_id: String,
+    pub label: Option<String>,
+    pub role: String,
+    pub scopes: Vec<String>,
+    pub is_service_account: bool,
+    pub bound_tenant_id: Option<String>,
+    pub bound_workspace_id: Option<String>,
+    pub requires_migration: bool,
+    pub observed_scopes: Vec<TenantScopeObservation>,
+    pub recommended_tenant_id: Option<String>,
+    pub recommended_workspace_id: Option<String>,
+    pub recommendation_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CredentialMigrationPlan {
+    pub generated_at: DateTime<Utc>,
+    pub total_credentials: usize,
+    pub bound_credentials: usize,
+    pub unbound_credentials: usize,
+    pub suggestions: Vec<CredentialMigrationSuggestion>,
+}
+
 #[derive(Clone, Debug)]
 pub struct RotateCredentialCommand {
     pub old_token: String,
@@ -1619,6 +1651,117 @@ impl AuthService {
         Ok(guard.iter().rev().take(limit).cloned().collect())
     }
 
+    pub fn credential_migration_plan(
+        &self,
+        observation_limit: Option<usize>,
+    ) -> Result<CredentialMigrationPlan, AuthAdminError> {
+        if !self.enabled {
+            return Err(AuthAdminError::NotEnabled);
+        }
+
+        let observation_limit = observation_limit.unwrap_or(5).clamp(1, 20);
+
+        let credentials_guard = self
+            .credentials
+            .lock()
+            .map_err(|_| AuthAdminError::StoragePoisoned)?;
+        let access_events_guard = self
+            .access_events
+            .lock()
+            .map_err(|_| AuthAdminError::StoragePoisoned)?;
+
+        let mut suggestions = credentials_guard
+            .values()
+            .map(|entry| {
+                let mut scope_counts: HashMap<(String, Option<String>), usize> = HashMap::new();
+                for event in access_events_guard.iter() {
+                    if event.outcome != "allow" {
+                        continue;
+                    }
+                    if event.principal_id.as_deref() != Some(entry.key_id.as_str()) {
+                        continue;
+                    }
+                    let Some(tenant_id) = event.tenant_id.clone() else {
+                        continue;
+                    };
+
+                    let key = (tenant_id, event.workspace_id.clone());
+                    let count = scope_counts.entry(key).or_insert(0);
+                    *count = count.saturating_add(1);
+                }
+
+                let mut observed_scopes = scope_counts
+                    .into_iter()
+                    .map(
+                        |((tenant_id, workspace_id), allow_count)| TenantScopeObservation {
+                            tenant_id,
+                            workspace_id,
+                            allow_count,
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                observed_scopes.sort_by(|left, right| {
+                    right
+                        .allow_count
+                        .cmp(&left.allow_count)
+                        .then_with(|| left.tenant_id.cmp(&right.tenant_id))
+                        .then_with(|| left.workspace_id.cmp(&right.workspace_id))
+                });
+                observed_scopes.truncate(observation_limit);
+
+                let bound_tenant_id = entry.bound_tenant_scope.tenant_id.clone();
+                let bound_workspace_id = entry.bound_tenant_scope.workspace_id.clone();
+                let requires_migration = bound_tenant_id.is_none();
+
+                let (recommended_tenant_id, recommended_workspace_id, recommendation_reason) =
+                    if !requires_migration {
+                        (bound_tenant_id.clone(), bound_workspace_id.clone(), None)
+                    } else if observed_scopes.len() == 1 {
+                        (
+                            Some(observed_scopes[0].tenant_id.clone()),
+                            observed_scopes[0].workspace_id.clone(),
+                            Some("single_observed_scope".to_string()),
+                        )
+                    } else if observed_scopes.is_empty() {
+                        (None, None, Some("insufficient_observations".to_string()))
+                    } else {
+                        (None, None, Some("ambiguous_observations".to_string()))
+                    };
+
+                CredentialMigrationSuggestion {
+                    key_id: entry.key_id.clone(),
+                    label: entry.label.clone(),
+                    role: entry.role.clone(),
+                    scopes: entry.scopes.clone(),
+                    is_service_account: entry.is_service_account,
+                    bound_tenant_id,
+                    bound_workspace_id,
+                    requires_migration,
+                    observed_scopes,
+                    recommended_tenant_id,
+                    recommended_workspace_id,
+                    recommendation_reason,
+                }
+            })
+            .collect::<Vec<_>>();
+        suggestions.sort_by(|left, right| left.key_id.cmp(&right.key_id));
+
+        let total_credentials = suggestions.len();
+        let unbound_credentials = suggestions
+            .iter()
+            .filter(|entry| entry.requires_migration)
+            .count();
+        let bound_credentials = total_credentials.saturating_sub(unbound_credentials);
+
+        Ok(CredentialMigrationPlan {
+            generated_at: Utc::now(),
+            total_credentials,
+            bound_credentials,
+            unbound_credentials,
+            suggestions,
+        })
+    }
+
     fn update_key_lifecycle_state<F>(
         &self,
         key_id: &str,
@@ -1990,6 +2133,7 @@ fn required_permission(method: &Method, path: &str) -> Option<&'static str> {
         ("GET", "/api/llm/health") => Some("llm:read"),
         ("GET", "/v1/models") => Some("llm:read"),
         ("GET", "/api/auth/keys") => Some("auth:read"),
+        ("GET", "/api/auth/keys/migration-plan") => Some("auth:read"),
         ("POST", "/api/auth/keys/generate") => Some("auth:write"),
         ("POST", "/api/auth/keys/rotate") => Some("auth:write"),
         ("POST", "/api/auth/keys/revoke") => Some("auth:write"),
@@ -2801,6 +2945,103 @@ mod tests {
         assert_eq!(payload["event"]["outcome"], "allow");
         assert_eq!(payload["event"]["method"], "POST");
         assert_eq!(payload["event"]["path"], "/api/compliance/check");
+    }
+
+    #[test]
+    fn migration_plan_recommends_single_observed_scope_for_unbound_key() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+        settings.tenant_isolation_enabled = true;
+        settings.tenant_require_workspace = true;
+        settings.auth_api_keys = vec![AuthCredentialConfig {
+            label: Some("legacy-unbound".to_string()),
+            token: "legacy-token".to_string(),
+            role: "developer".to_string(),
+            scopes: vec!["audit:read".to_string()],
+            tenant_id: None,
+            workspace_id: None,
+        }];
+
+        let service = AuthService::from_settings(&settings);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "legacy-token".parse().expect("header"));
+        headers.insert("x-tenant-id", "tenant-a".parse().expect("header"));
+        headers.insert("x-workspace-id", "workspace-prod".parse().expect("header"));
+
+        let authorization = service.authorize_request(&headers, &Method::POST, "/api/audit/trail");
+        assert!(authorization.is_ok());
+
+        let plan = service
+            .credential_migration_plan(Some(5))
+            .expect("migration plan should generate");
+        assert_eq!(plan.total_credentials, 1);
+        assert_eq!(plan.unbound_credentials, 1);
+
+        let suggestion = plan.suggestions.first().expect("one suggestion");
+        assert!(!suggestion.key_id.is_empty());
+        assert_eq!(
+            suggestion.recommended_tenant_id.as_deref(),
+            Some("tenant-a")
+        );
+        assert_eq!(
+            suggestion.recommended_workspace_id.as_deref(),
+            Some("workspace-prod")
+        );
+        assert_eq!(
+            suggestion.recommendation_reason.as_deref(),
+            Some("single_observed_scope")
+        );
+    }
+
+    #[test]
+    fn migration_plan_marks_ambiguous_scopes_without_recommendation() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+        settings.tenant_isolation_enabled = true;
+        settings.tenant_require_workspace = true;
+        settings.auth_api_keys = vec![AuthCredentialConfig {
+            label: Some("legacy-unbound".to_string()),
+            token: "legacy-token".to_string(),
+            role: "developer".to_string(),
+            scopes: vec!["audit:read".to_string()],
+            tenant_id: None,
+            workspace_id: None,
+        }];
+
+        let service = AuthService::from_settings(&settings);
+
+        let mut prod_headers = HeaderMap::new();
+        prod_headers.insert("x-api-key", "legacy-token".parse().expect("header"));
+        prod_headers.insert("x-tenant-id", "tenant-a".parse().expect("header"));
+        prod_headers.insert("x-workspace-id", "workspace-prod".parse().expect("header"));
+        assert!(
+            service
+                .authorize_request(&prod_headers, &Method::POST, "/api/audit/trail")
+                .is_ok()
+        );
+
+        let mut dev_headers = HeaderMap::new();
+        dev_headers.insert("x-api-key", "legacy-token".parse().expect("header"));
+        dev_headers.insert("x-tenant-id", "tenant-a".parse().expect("header"));
+        dev_headers.insert("x-workspace-id", "workspace-dev".parse().expect("header"));
+        assert!(
+            service
+                .authorize_request(&dev_headers, &Method::POST, "/api/audit/trail")
+                .is_ok()
+        );
+
+        let plan = service
+            .credential_migration_plan(Some(5))
+            .expect("migration plan should generate");
+        let suggestion = plan.suggestions.first().expect("one suggestion");
+
+        assert!(suggestion.recommended_tenant_id.is_none());
+        assert!(suggestion.recommended_workspace_id.is_none());
+        assert_eq!(
+            suggestion.recommendation_reason.as_deref(),
+            Some("ambiguous_observations")
+        );
+        assert_eq!(suggestion.observed_scopes.len(), 2);
     }
 
     fn test_settings() -> AppSettings {
