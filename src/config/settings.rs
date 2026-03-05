@@ -40,6 +40,8 @@ pub struct AuthCredentialConfig {
     pub token: String,
     pub role: String,
     pub scopes: Vec<String>,
+    pub tenant_id: Option<String>,
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -289,7 +291,10 @@ fn parse_auth_credentials(key: &str) -> Vec<AuthCredentialConfig> {
 }
 
 fn parse_auth_credential_entry(entry: &str) -> Option<AuthCredentialConfig> {
-    let fields = entry.splitn(3, ':').collect::<Vec<_>>();
+    let (credential_fields, tenant_binding) = entry
+        .split_once('@')
+        .map_or((entry, None), |(left, right)| (left, Some(right)));
+    let fields = credential_fields.splitn(3, ':').collect::<Vec<_>>();
     if fields.len() < 2 {
         return None;
     }
@@ -311,12 +316,49 @@ fn parse_auth_credential_entry(entry: &str) -> Option<AuthCredentialConfig> {
         Vec::new()
     };
 
+    let (tenant_id, workspace_id) = parse_auth_tenant_binding(tenant_binding)?;
+
     Some(AuthCredentialConfig {
         label: None,
         token: token.to_owned(),
         role: role.to_owned(),
         scopes,
+        tenant_id,
+        workspace_id,
     })
+}
+
+fn parse_auth_tenant_binding(binding: Option<&str>) -> Option<(Option<String>, Option<String>)> {
+    let Some(binding) = binding else {
+        return Some((None, None));
+    };
+
+    let binding = binding.trim();
+    if binding.is_empty() {
+        return Some((None, None));
+    }
+
+    let (tenant_raw, workspace_raw) = binding
+        .split_once('/')
+        .map_or((binding, None), |(tenant, workspace)| {
+            (tenant, Some(workspace))
+        });
+
+    let tenant = tenant_raw.trim();
+    if tenant.is_empty() {
+        return None;
+    }
+
+    let workspace = workspace_raw.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
+    Some((Some(tenant.to_string()), workspace))
 }
 
 fn parse_env_bool(key: &str, default: bool) -> bool {

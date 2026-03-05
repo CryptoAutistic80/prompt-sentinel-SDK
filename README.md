@@ -91,7 +91,7 @@ docker run -d \
 | `LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | Consecutive failures before open | `5` |
 | `LLM_CIRCUIT_BREAKER_OPEN_DURATION_SECS` | Circuit open window | `30` |
 | `AUTH_ENABLED` | Enable API key auth + RBAC middleware | `false` |
-| `AUTH_API_KEYS` | Comma-separated `token:role[:scope1\|scope2]` values | None |
+| `AUTH_API_KEYS` | Comma-separated `token:role[:scope1\|scope2][@tenant_id[/workspace_id]]` values | None |
 | `AUTH_SERVICE_TOKENS` | Comma-separated service tokens in same format | None |
 | `AUTH_RATE_LIMIT_PER_MINUTE` | Per-key request limit per 60s | `300` |
 | `AUTH_KEY_STORE_PATH` | Persistent auth key store path | `prompt_sentinel_data/auth_keys.json` |
@@ -315,7 +315,9 @@ Generate a new API credential. The plaintext `token` is returned only once.
   "scopes": ["check:invoke", "audit:read"],
   "label": "ci-staging",
   "is_service_account": true,
-  "expires_in_seconds": 3600
+  "expires_in_seconds": 3600,
+  "tenant_id": "tenant-a",
+  "workspace_id": "workspace-prod"
 }
 ```
 
@@ -339,6 +341,13 @@ Global scopes such as `check:invoke` remain valid and act as a fallback.
 When `TENANT_ISOLATION_ENABLED=true`, authenticated requests must include a valid tenant identifier
 (`TENANT_ID_HEADER`, default `x-tenant-id`). If `TENANT_REQUIRE_WORKSPACE=true`, workspace scope is
 also required (`WORKSPACE_ID_HEADER`, default `x-workspace-id`).
+
+API/service credentials can now be tenant/workspace bound at issuance time (`tenant_id`, `workspace_id`)
+or via env bootstrap (`AUTH_API_KEYS` suffix `@tenant[/workspace]`). For bound credentials:
+
+- Missing tenant/workspace headers are auto-resolved from the credential binding.
+- Header values that conflict with credential binding are denied.
+- Header spoofing cannot switch bound credentials across tenants/workspaces.
 
 Quota hooks are middleware-enforced and disabled by default:
 
@@ -378,7 +387,9 @@ Rotate a credential without restarting the server.
   "new_token": "new-api-token",
   "role": "developer",
   "scopes": ["check:invoke", "audit:read"],
-  "expires_in_seconds": 86400
+  "expires_in_seconds": 86400,
+  "tenant_id": "tenant-a",
+  "workspace_id": "workspace-prod"
 }
 ```
 

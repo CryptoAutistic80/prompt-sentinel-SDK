@@ -7,7 +7,7 @@ Execution Mode: Phase-by-phase production hardening
 
 ## Current Stage Outcome
 
-This stage advanced **Phase 2 penetration-test enforcement** by moving isolation checks to API-level end-to-end tests (auth middleware + handlers), adding adversarial token replay and spoofed-header scenarios, and wiring a dedicated CI isolation regression gate.
+This stage advanced **Phase 2 tenant identity hardening** by binding API/service credentials to tenant/workspace scope, enforcing those bindings in auth middleware, and proving that tenant/workspace switching via headers is denied.
 
 ### Completed to date in this phase
 
@@ -188,6 +188,22 @@ This stage advanced **Phase 2 penetration-test enforcement** by moving isolation
   - new GitHub Actions workflow `.github/workflows/isolation-regressions.yml`
   - runs `cargo test pentest_ -- --nocapture`
   - runs `cargo test --test security_regressions -- --nocapture`
+- Added credential-bound tenant/workspace identity controls:
+  - `AuthCredentialConfig` now supports optional `tenant_id` + `workspace_id`
+  - generated/rotated credentials can be issued with tenant/workspace bindings
+  - persisted credential snapshots retain tenant/workspace bindings
+  - API-key auth now resolves/pins tenant scope from credential bindings before tenant policy checks
+  - conflicting tenant/workspace headers against bound credentials are denied fail-closed
+- Added tenant-bound isolation tests in `AuthService`:
+  - bound key pins tenant scope even without tenant headers
+  - bound key rejects tenant header switching attempts
+  - workspace-bound key satisfies strict workspace requirements without workspace headers
+- Added API-boundary pentest coverage for bound credentials:
+  - bound key rejects cross-tenant header switch attempts on `/api/audit/trail`
+  - bound key allows tenant/workspace-scoped access without tenant/workspace headers
+- Extended auth bootstrap format docs:
+  - `AUTH_API_KEYS` now supports optional `@tenant_id[/workspace_id]` suffix
+  - auth key generate/rotate request schemas now document optional `tenant_id` + `workspace_id`
 
 ## Phase Status Dashboard
 
@@ -195,7 +211,7 @@ This stage advanced **Phase 2 penetration-test enforcement** by moving isolation
 |---|---|---|
 | Phase 0 - Foundation Hardening | In Progress | Core security/reliability foundations implemented; OTel/Sentry/chaos/contract testing remain. |
 | Phase 1 - Provider-Agnostic LLM Support | In Progress | Provider abstraction + backend switching implemented; routing/fallback/cost optimization pending. |
-| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + mTLS auth + durable auth access auditing + resource-level permission scaffold + tenant/workspace isolation baseline + first-pass tenant quota hooks + pluggable durable tenant quota backend (`memory`/`sled`) + tenant/workspace policy overlays + audit query isolation filters + audit residency metadata + runtime fail-closed residency checks + API-level adversarial isolation pentest suite + CI isolation gates implemented. |
+| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + mTLS auth + durable auth access auditing + resource-level permission scaffold + tenant/workspace isolation baseline + first-pass tenant quota hooks + pluggable durable tenant quota backend (`memory`/`sled`) + tenant/workspace policy overlays + audit query isolation filters + audit residency metadata + runtime fail-closed residency checks + API-level adversarial isolation pentest suite + tenant/workspace-bound credential identity enforcement + CI isolation gates implemented. |
 | Phase 3 - Comprehensive EU AI Act Coverage | In Progress | Baseline classification exists; full article-by-article depth pending. |
 | Phase 4 - Audit Trail & Evidence Management | In Progress | Existing audit trail and proofs active; v2 schema + advanced exports/retention lifecycle pending. |
 | Phase 5 - Configuration & Rules Management | In Progress | Env-driven config active; hot reload/staged rollout/rollback/policy-as-code pending. |
@@ -271,28 +287,35 @@ This stage advanced **Phase 2 penetration-test enforcement** by moving isolation
   - Penetration-test harness cases for cross-tenant/cross-workspace/cross-region traversal attempts.
   - API-level E2E isolation tests through auth middleware + audit route handlers.
   - Adversarial replay/spoofing scenarios (post-rotation token replay denial + spoofed tenant header rejection).
+  - Tenant/workspace-bound API credentials with fail-closed header mismatch enforcement.
+  - Credential lifecycle support for tenant/workspace bindings (generate/rotate/persist/list).
+  - API-level pentest coverage for tenant-bound credential behavior.
   - Dedicated CI isolation/security regression workflow (`isolation-regressions.yml`).
 - Remaining:
-  - Add tenant-bound API-key identity constraints (header scope must match credential-assigned tenant/workspace) to remove header-only tenant identity trust.
   - Expand E2E adversarial coverage for OIDC/mTLS principals and mixed project/environment resource-scope traversal.
+  - Add revocation/rotation playbooks and migration guidance for moving existing unbound keys to bound-key posture.
 
 ## Validation
 
 Commands run for this stage:
 
-- `rustfmt --edition 2024 src/server.rs` -> pass
-- `cargo test pentest_api_ -- --nocapture` -> pass
-- `cargo test pentest_ -- --nocapture` -> pass
+- `rustfmt --edition 2024 src/modules/auth/mod.rs src/server.rs src/config/settings.rs` -> pass
+- `cargo test tenant_bound_api_key -- --nocapture` -> pass
+- `cargo test workspace_bound_api_key -- --nocapture` -> pass
+- `cargo test pentest_api_tenant_bound_key -- --nocapture` -> pass
 - `cargo test` -> pass (all suites green; benchmark test intentionally ignored)
 
 ## Files Changed This Stage
 
 - `src/server.rs`
-- `.github/workflows/isolation-regressions.yml`
+- `src/modules/auth/mod.rs`
+- `src/config/settings.rs`
+- `README.md`
+- `.env.example`
 - `PROGRESS_SUMMARY.md`
 
 ## Next Execution Slice
 
-1. Implement tenant/workspace-bound API credentials so tenant identity cannot be switched by headers alone.
-2. Extend API-level adversarial suites for OIDC/mTLS principals and mixed resource-scope traversal (`x-project-id` / `x-environment`).
-3. Add operator docs/playbooks for isolation regression triage and release-blocking criteria.
+1. Add OIDC + mTLS parity tests for mixed tenant/resource traversal (project/environment + tenant/workspace combinations).
+2. Implement migration tooling/guide to rotate legacy unbound credentials into bound tenant/workspace credentials safely.
+3. Add runbooks for credential-scope mismatch incidents (detection, rollback, and tenant impact triage).

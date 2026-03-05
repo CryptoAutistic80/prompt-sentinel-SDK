@@ -53,6 +53,7 @@ struct CredentialEntry {
     label: Option<String>,
     role: String,
     scopes: Vec<String>,
+    bound_tenant_scope: TenantScope,
     is_service_account: bool,
     created_at: DateTime<Utc>,
     rotated_at: Option<DateTime<Utc>>,
@@ -68,6 +69,8 @@ impl CredentialEntry {
             label: self.label.clone(),
             role: self.role.clone(),
             scopes: self.scopes.clone(),
+            bound_tenant_id: self.bound_tenant_scope.tenant_id.clone(),
+            bound_workspace_id: self.bound_tenant_scope.workspace_id.clone(),
             is_service_account: self.is_service_account,
             created_at: self.created_at,
             rotated_at: self.rotated_at,
@@ -116,6 +119,10 @@ struct StoredCredential {
     label: Option<String>,
     role: String,
     scopes: Vec<String>,
+    #[serde(default)]
+    bound_tenant_id: Option<String>,
+    #[serde(default)]
+    bound_workspace_id: Option<String>,
     is_service_account: bool,
     created_at: DateTime<Utc>,
     rotated_at: Option<DateTime<Utc>>,
@@ -131,6 +138,8 @@ impl StoredCredential {
             label: entry.label.clone(),
             role: entry.role.clone(),
             scopes: entry.scopes.clone(),
+            bound_tenant_id: entry.bound_tenant_scope.tenant_id.clone(),
+            bound_workspace_id: entry.bound_tenant_scope.workspace_id.clone(),
             is_service_account: entry.is_service_account,
             created_at: entry.created_at,
             rotated_at: entry.rotated_at,
@@ -145,6 +154,13 @@ impl StoredCredential {
             return None;
         }
 
+        let bound_tenant_scope = normalize_bound_tenant_scope(
+            self.bound_tenant_id,
+            self.bound_workspace_id,
+            "stored credential binding",
+        )
+        .ok()?;
+
         Some((
             token_hash,
             CredentialEntry {
@@ -152,6 +168,7 @@ impl StoredCredential {
                 label: self.label,
                 role: self.role,
                 scopes: self.scopes,
+                bound_tenant_scope,
                 is_service_account: self.is_service_account,
                 created_at: self.created_at,
                 rotated_at: self.rotated_at,
@@ -424,6 +441,8 @@ pub struct CredentialMetadata {
     pub label: Option<String>,
     pub role: String,
     pub scopes: Vec<String>,
+    pub bound_tenant_id: Option<String>,
+    pub bound_workspace_id: Option<String>,
     pub is_service_account: bool,
     pub created_at: DateTime<Utc>,
     pub rotated_at: Option<DateTime<Utc>>,
@@ -456,6 +475,8 @@ pub struct RotateCredentialCommand {
     pub label: Option<String>,
     pub is_service_account: Option<bool>,
     pub expires_in_seconds: Option<u64>,
+    pub tenant_id: Option<String>,
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -465,6 +486,8 @@ pub struct GenerateCredentialCommand {
     pub label: Option<String>,
     pub is_service_account: bool,
     pub expires_in_seconds: Option<u64>,
+    pub tenant_id: Option<String>,
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -752,8 +775,19 @@ impl AuthService {
             return Err(AuthError::ExpiredCredentials);
         }
 
-        self.enforce_tenant_scope(
+        let resolved_tenant_scope = self.resolve_api_token_tenant_scope(
             tenant_scope,
+            &entry.bound_tenant_scope,
+            &entry.key_id,
+            &entry.role,
+            method,
+            path,
+            required_permission,
+            correlation_id,
+        )?;
+
+        self.enforce_tenant_scope(
+            &resolved_tenant_scope,
             &entry.key_id,
             &entry.role,
             method,
@@ -770,8 +804,8 @@ impl AuthService {
                 timestamp: Utc::now(),
                 principal_id: Some(entry.key_id.clone()),
                 role: Some(entry.role.clone()),
-                tenant_id: tenant_scope.tenant_id.clone(),
-                workspace_id: tenant_scope.workspace_id.clone(),
+                tenant_id: resolved_tenant_scope.tenant_id.clone(),
+                workspace_id: resolved_tenant_scope.workspace_id.clone(),
                 method: method.as_str().to_owned(),
                 path: path.to_owned(),
                 outcome: "deny_rate_limited".to_string(),
@@ -787,8 +821,8 @@ impl AuthService {
                 timestamp: Utc::now(),
                 principal_id: Some(entry.key_id.clone()),
                 role: Some(entry.role.clone()),
-                tenant_id: tenant_scope.tenant_id.clone(),
-                workspace_id: tenant_scope.workspace_id.clone(),
+                tenant_id: resolved_tenant_scope.tenant_id.clone(),
+                workspace_id: resolved_tenant_scope.workspace_id.clone(),
                 method: method.as_str().to_owned(),
                 path: path.to_owned(),
                 outcome: "deny_forbidden".to_string(),
@@ -810,8 +844,8 @@ impl AuthService {
             timestamp: Utc::now(),
             principal_id: Some(entry.key_id.clone()),
             role: Some(entry.role.clone()),
-            tenant_id: tenant_scope.tenant_id.clone(),
-            workspace_id: tenant_scope.workspace_id.clone(),
+            tenant_id: resolved_tenant_scope.tenant_id.clone(),
+            workspace_id: resolved_tenant_scope.workspace_id.clone(),
             method: method.as_str().to_owned(),
             path: path.to_owned(),
             outcome: "allow".to_string(),
@@ -827,7 +861,7 @@ impl AuthService {
             role: entry.role,
             is_service_account: entry.is_service_account,
             scopes: entry.scopes,
-            tenant_scope: tenant_scope.clone(),
+            tenant_scope: resolved_tenant_scope,
             resource_scope: resource_scope.clone(),
         })
     }
@@ -1187,6 +1221,76 @@ impl AuthService {
         }))
     }
 
+    fn resolve_api_token_tenant_scope(
+        &self,
+        tenant_scope_from_headers: &TenantScope,
+        credential_bound_scope: &TenantScope,
+        principal_id: &str,
+        role: &str,
+        method: &Method,
+        path: &str,
+        required_permission: &Option<String>,
+        correlation_id: &Option<String>,
+    ) -> Result<TenantScope, AuthError> {
+        let mut resolved_scope = tenant_scope_from_headers.clone();
+
+        if let Some(bound_tenant) = credential_bound_scope.tenant_id.as_deref() {
+            if let Some(header_tenant) = tenant_scope_from_headers.tenant_id.as_deref()
+                && header_tenant != bound_tenant
+            {
+                self.record_access(AccessAuditEvent {
+                    correlation_id: correlation_id.clone(),
+                    timestamp: Utc::now(),
+                    principal_id: Some(principal_id.to_string()),
+                    role: Some(role.to_string()),
+                    tenant_id: Some(header_tenant.to_string()),
+                    workspace_id: tenant_scope_from_headers.workspace_id.clone(),
+                    method: method.as_str().to_owned(),
+                    path: path.to_owned(),
+                    outcome: "deny_tenant_scope_mismatch".to_string(),
+                    required_permission: required_permission.clone(),
+                    detail: Some(
+                        "tenant header does not match credential tenant binding".to_string(),
+                    ),
+                });
+                return Err(AuthError::InvalidTenantScope {
+                    detail: "tenant scope does not match credential binding".to_string(),
+                });
+            }
+
+            resolved_scope.tenant_id = Some(bound_tenant.to_string());
+        }
+
+        if let Some(bound_workspace) = credential_bound_scope.workspace_id.as_deref() {
+            if let Some(header_workspace) = tenant_scope_from_headers.workspace_id.as_deref()
+                && header_workspace != bound_workspace
+            {
+                self.record_access(AccessAuditEvent {
+                    correlation_id: correlation_id.clone(),
+                    timestamp: Utc::now(),
+                    principal_id: Some(principal_id.to_string()),
+                    role: Some(role.to_string()),
+                    tenant_id: resolved_scope.tenant_id.clone(),
+                    workspace_id: Some(header_workspace.to_string()),
+                    method: method.as_str().to_owned(),
+                    path: path.to_owned(),
+                    outcome: "deny_tenant_scope_mismatch".to_string(),
+                    required_permission: required_permission.clone(),
+                    detail: Some(
+                        "workspace header does not match credential workspace binding".to_string(),
+                    ),
+                });
+                return Err(AuthError::InvalidTenantScope {
+                    detail: "workspace scope does not match credential binding".to_string(),
+                });
+            }
+
+            resolved_scope.workspace_id = Some(bound_workspace.to_string());
+        }
+
+        Ok(resolved_scope)
+    }
+
     fn resolve_oidc_tenant_scope(
         &self,
         tenant_scope_from_headers: &TenantScope,
@@ -1362,6 +1466,11 @@ impl AuthService {
             resolve_expiry(command.expires_in_seconds.or(self.default_key_expiry_secs))?;
         let label = normalize_optional_string(command.label);
         let scopes = normalize_scopes(command.scopes);
+        let bound_tenant_scope = normalize_bound_tenant_scope(
+            command.tenant_id,
+            command.workspace_id,
+            "credential binding",
+        )?;
 
         let mut guard = self
             .credentials
@@ -1377,6 +1486,7 @@ impl AuthService {
             label,
             role: role.to_owned(),
             scopes,
+            bound_tenant_scope,
             is_service_account: command.is_service_account,
             created_at: now,
             rotated_at: None,
@@ -1457,6 +1567,14 @@ impl AuthService {
 
         if command.expires_in_seconds.is_some() {
             entry.expires_at = resolve_expiry(command.expires_in_seconds)?;
+        }
+
+        if command.tenant_id.is_some() || command.workspace_id.is_some() {
+            entry.bound_tenant_scope = normalize_bound_tenant_scope(
+                command.tenant_id,
+                command.workspace_id,
+                "credential binding",
+            )?;
         }
 
         entry.key_id = credential_fingerprint_from_hash(&new_hash);
@@ -1633,12 +1751,28 @@ fn register_credentials(
             continue;
         }
 
+        let bound_tenant_scope = match normalize_bound_tenant_scope(
+            credential.tenant_id.clone(),
+            credential.workspace_id.clone(),
+            "configured credential binding",
+        ) {
+            Ok(scope) => scope,
+            Err(error) => {
+                warn!(
+                    "Skipping auth credential with invalid tenant/workspace binding: {}",
+                    error
+                );
+                continue;
+            }
+        };
+
         let token_hash = hash_token(&credential.token);
         let entry = CredentialEntry {
             key_id: credential_fingerprint_from_hash(&token_hash),
             label: credential.label.clone(),
             role: credential.role.clone(),
             scopes: normalize_scopes(credential.scopes.clone()),
+            bound_tenant_scope,
             is_service_account,
             created_at: Utc::now(),
             rotated_at: None,
@@ -1983,6 +2117,30 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
     })
 }
 
+fn normalize_bound_tenant_scope(
+    tenant_id: Option<String>,
+    workspace_id: Option<String>,
+    context: &str,
+) -> Result<TenantScope, AuthAdminError> {
+    let tenant_id = tenant_id
+        .and_then(|value| normalize_resource_segment(&value))
+        .map(|value| value.to_string());
+    let workspace_id = workspace_id
+        .and_then(|value| normalize_resource_segment(&value))
+        .map(|value| value.to_string());
+
+    if tenant_id.is_none() && workspace_id.is_some() {
+        return Err(AuthAdminError::InvalidRequest(format!(
+            "{context} requires tenant_id when workspace_id is set"
+        )));
+    }
+
+    Ok(TenantScope {
+        tenant_id,
+        workspace_id,
+    })
+}
+
 fn normalize_scopes(scopes: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut normalized = Vec::new();
@@ -2127,6 +2285,8 @@ mod tests {
             token: "tenant-token".to_string(),
             role: "developer".to_string(),
             scopes: vec!["check:invoke".to_string()],
+            tenant_id: None,
+            workspace_id: None,
         }];
 
         let service = AuthService::from_settings(&settings);
@@ -2148,6 +2308,8 @@ mod tests {
             token: "tenant-token".to_string(),
             role: "developer".to_string(),
             scopes: vec!["check:invoke".to_string()],
+            tenant_id: None,
+            workspace_id: None,
         }];
 
         let service = AuthService::from_settings(&settings);
@@ -2165,6 +2327,88 @@ mod tests {
         assert_eq!(
             result.tenant_scope.workspace_id.as_deref(),
             Some("workspace-1")
+        );
+    }
+
+    #[test]
+    fn tenant_bound_api_key_pins_scope_without_headers() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+        settings.tenant_isolation_enabled = true;
+        settings.auth_api_keys = vec![AuthCredentialConfig {
+            label: None,
+            token: "tenant-bound-token".to_string(),
+            role: "developer".to_string(),
+            scopes: vec!["check:invoke".to_string()],
+            tenant_id: Some("tenant-a".to_string()),
+            workspace_id: None,
+        }];
+
+        let service = AuthService::from_settings(&settings);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "tenant-bound-token".parse().expect("header"));
+
+        let context = service
+            .authorize_request(&headers, &Method::POST, "/api/compliance/check")
+            .expect("authorization should pass")
+            .expect("context should be present");
+        assert_eq!(context.tenant_scope.tenant_id.as_deref(), Some("tenant-a"));
+        assert_eq!(context.tenant_scope.workspace_id, None);
+    }
+
+    #[test]
+    fn tenant_bound_api_key_rejects_header_tenant_switch() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+        settings.tenant_isolation_enabled = true;
+        settings.auth_api_keys = vec![AuthCredentialConfig {
+            label: None,
+            token: "tenant-bound-token".to_string(),
+            role: "developer".to_string(),
+            scopes: vec!["check:invoke".to_string()],
+            tenant_id: Some("tenant-a".to_string()),
+            workspace_id: None,
+        }];
+
+        let service = AuthService::from_settings(&settings);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "tenant-bound-token".parse().expect("header"));
+        headers.insert("x-tenant-id", "tenant-b".parse().expect("header"));
+
+        let result = service.authorize_request(&headers, &Method::POST, "/api/compliance/check");
+        assert!(matches!(result, Err(AuthError::InvalidTenantScope { .. })));
+    }
+
+    #[test]
+    fn workspace_bound_api_key_satisfies_workspace_requirement_without_header() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+        settings.tenant_isolation_enabled = true;
+        settings.tenant_require_workspace = true;
+        settings.auth_api_keys = vec![AuthCredentialConfig {
+            label: None,
+            token: "workspace-bound-token".to_string(),
+            role: "developer".to_string(),
+            scopes: vec!["check:invoke".to_string()],
+            tenant_id: Some("tenant-a".to_string()),
+            workspace_id: Some("workspace-prod".to_string()),
+        }];
+
+        let service = AuthService::from_settings(&settings);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-api-key",
+            "workspace-bound-token".parse().expect("header"),
+        );
+
+        let context = service
+            .authorize_request(&headers, &Method::POST, "/api/compliance/check")
+            .expect("authorization should pass")
+            .expect("context should be present");
+        assert_eq!(context.tenant_scope.tenant_id.as_deref(), Some("tenant-a"));
+        assert_eq!(
+            context.tenant_scope.workspace_id.as_deref(),
+            Some("workspace-prod")
         );
     }
 
@@ -2211,6 +2455,8 @@ mod tests {
             token: "resource-token".to_string(),
             role: "developer".to_string(),
             scopes: vec!["check:invoke:project:alpha:env:prod".to_string()],
+            tenant_id: None,
+            workspace_id: None,
         }];
 
         let service = AuthService::from_settings(&settings);
@@ -2238,6 +2484,8 @@ mod tests {
             token: "resource-token".to_string(),
             role: "developer".to_string(),
             scopes: vec!["check:invoke:project:alpha:env:prod".to_string()],
+            tenant_id: None,
+            workspace_id: None,
         }];
 
         let service = AuthService::from_settings(&settings);
@@ -2260,6 +2508,8 @@ mod tests {
             token: "global-token".to_string(),
             role: "developer".to_string(),
             scopes: vec!["check:invoke".to_string()],
+            tenant_id: None,
+            workspace_id: None,
         }];
 
         let service = AuthService::from_settings(&settings);
@@ -2282,6 +2532,8 @@ mod tests {
             token: "old-token".to_string(),
             role: "compliance_admin".to_string(),
             scopes: vec![],
+            tenant_id: None,
+            workspace_id: None,
         }];
 
         let service = AuthService::from_settings(&settings);
@@ -2302,6 +2554,8 @@ mod tests {
                 label: None,
                 is_service_account: None,
                 expires_in_seconds: None,
+                tenant_id: None,
+                workspace_id: None,
             })
             .expect("rotation should work");
 
@@ -2317,6 +2571,8 @@ mod tests {
             token: "expiring-token".to_string(),
             role: "compliance_admin".to_string(),
             scopes: vec![],
+            tenant_id: None,
+            workspace_id: None,
         }];
 
         let service = AuthService::from_settings(&settings);
@@ -2348,6 +2604,8 @@ mod tests {
             token: "revoked-token".to_string(),
             role: "compliance_admin".to_string(),
             scopes: vec![],
+            tenant_id: None,
+            workspace_id: None,
         }];
 
         let service = AuthService::from_settings(&settings);
@@ -2391,6 +2649,8 @@ mod tests {
                 label: Some("generated".to_string()),
                 is_service_account: false,
                 expires_in_seconds: None,
+                tenant_id: None,
+                workspace_id: None,
             })
             .expect("generated");
 
@@ -2430,6 +2690,8 @@ mod tests {
                 label: None,
                 is_service_account: false,
                 expires_in_seconds: None,
+                tenant_id: None,
+                workspace_id: None,
             })
             .expect("generated");
 
@@ -2483,6 +2745,8 @@ mod tests {
             token: "durable-token".to_string(),
             role: "compliance_admin".to_string(),
             scopes: vec![],
+            tenant_id: None,
+            workspace_id: None,
         }];
 
         let storage = Arc::new(InMemoryAuditStorage::new());

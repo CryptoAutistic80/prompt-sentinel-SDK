@@ -938,6 +938,8 @@ struct RotateAuthKeyRequest {
     label: Option<String>,
     is_service_account: Option<bool>,
     expires_in_seconds: Option<u64>,
+    tenant_id: Option<String>,
+    workspace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -947,6 +949,8 @@ struct GenerateAuthKeyRequest {
     label: Option<String>,
     is_service_account: Option<bool>,
     expires_in_seconds: Option<u64>,
+    tenant_id: Option<String>,
+    workspace_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -982,6 +986,8 @@ async fn rotate_auth_key(
             label: request.label,
             is_service_account: request.is_service_account,
             expires_in_seconds: request.expires_in_seconds,
+            tenant_id: request.tenant_id,
+            workspace_id: request.workspace_id,
         })
         .map_err(map_auth_admin_error)?;
 
@@ -1003,6 +1009,8 @@ async fn generate_auth_key(
             label: request.label,
             is_service_account: request.is_service_account.unwrap_or(false),
             expires_in_seconds: request.expires_in_seconds,
+            tenant_id: request.tenant_id,
+            workspace_id: request.workspace_id,
         })
         .map_err(map_auth_admin_error)?;
 
@@ -2005,6 +2013,69 @@ mod tests {
         assert_eq!(fresh_response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn pentest_api_tenant_bound_key_rejects_header_tenant_switch() {
+        let mut settings = pentest_settings("tenant-a-token", vec!["audit:read"]);
+        settings.auth_api_keys = vec![AuthCredentialConfig {
+            label: Some("tenant-bound".to_string()),
+            token: "tenant-a-token".to_string(),
+            role: "developer".to_string(),
+            scopes: vec!["audit:read".to_string()],
+            tenant_id: Some("tenant-a".to_string()),
+            workspace_id: Some("workspace-prod".to_string()),
+        }];
+        let app = build_test_router(settings, None);
+
+        let response = send_post(
+            &app,
+            "/api/audit/trail",
+            &[
+                ("x-api-key", "tenant-a-token"),
+                ("x-tenant-id", "tenant-b"),
+                ("x-workspace-id", "workspace-prod"),
+            ],
+            serde_json::json!({
+                "limit": 10,
+                "offset": 0,
+                "tenant_id": "tenant-b"
+            }),
+        )
+        .await;
+
+        let status = response.status();
+        let body = response_body_text(response).await.to_ascii_lowercase();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("tenant scope"));
+    }
+
+    #[tokio::test]
+    async fn pentest_api_tenant_bound_key_allows_without_tenant_headers() {
+        let mut settings = pentest_settings("tenant-a-token", vec!["audit:read"]);
+        settings.auth_api_keys = vec![AuthCredentialConfig {
+            label: Some("tenant-bound".to_string()),
+            token: "tenant-a-token".to_string(),
+            role: "developer".to_string(),
+            scopes: vec!["audit:read".to_string()],
+            tenant_id: Some("tenant-a".to_string()),
+            workspace_id: Some("workspace-prod".to_string()),
+        }];
+        settings.tenant_require_workspace = true;
+        let app = build_test_router(settings, None);
+
+        let response = send_post(
+            &app,
+            "/api/audit/trail",
+            &[("x-api-key", "tenant-a-token")],
+            serde_json::json!({
+                "limit": 10,
+                "offset": 0
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     fn test_auth_context(tenant_id: Option<&str>, workspace_id: Option<&str>) -> AuthContext {
         AuthContext {
             principal_id: "principal".to_string(),
@@ -2064,6 +2135,8 @@ mod tests {
                 token: api_token.to_string(),
                 role: "developer".to_string(),
                 scopes: scopes.into_iter().map(ToOwned::to_owned).collect(),
+                tenant_id: None,
+                workspace_id: None,
             }],
             auth_service_tokens: Vec::new(),
             auth_rate_limit_per_minute: 1_000,
