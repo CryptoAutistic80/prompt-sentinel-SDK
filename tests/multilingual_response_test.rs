@@ -1,4 +1,4 @@
-use prompt_sentinel::config::settings::AppSettings;
+use prompt_sentinel::config::settings::{AppSettings, LlmBackend};
 use prompt_sentinel::modules::audit::logger::AuditLogger;
 use prompt_sentinel::modules::audit::storage::AuditStorage;
 use prompt_sentinel::modules::audit::storage::SledAuditStorage;
@@ -15,11 +15,19 @@ async fn test_spanish_response_translation() {
     // Setup with mock Mistral client
     let settings = AppSettings {
         server_port: 3000,
-        mistral_api_key: Some("mock".to_string()),
-        mistral_base_url: "http://localhost".to_string(),
+        llm_backend: LlmBackend::OpenAICompat,
+        llm_api_key: Some("mock".to_string()),
+        llm_base_url: "http://localhost".to_string(),
         generation_model: "mock-model".to_string(),
         moderation_model: Some("mock-moderation".to_string()),
         embedding_model: "mock-embedding".to_string(),
+        cors_allowed_origins: vec!["http://localhost:5175".to_string()],
+        llm_request_timeout_secs: 120,
+        llm_connect_timeout_secs: 10,
+        llm_pool_max_idle_per_host: 20,
+        llm_pool_idle_timeout_secs: 90,
+        llm_circuit_breaker_failure_threshold: 5,
+        llm_circuit_breaker_open_duration_secs: 30,
         bias_threshold: 0.35,
         max_input_length: 4096,
         semantic_medium_threshold: 0.70,
@@ -89,11 +97,19 @@ async fn test_english_response_unchanged() {
     // Setup with mock Mistral client
     let settings = AppSettings {
         server_port: 3000,
-        mistral_api_key: Some("mock".to_string()),
-        mistral_base_url: "http://localhost".to_string(),
+        llm_backend: LlmBackend::OpenAICompat,
+        llm_api_key: Some("mock".to_string()),
+        llm_base_url: "http://localhost".to_string(),
         generation_model: "mock-model".to_string(),
         moderation_model: Some("mock-moderation".to_string()),
         embedding_model: "mock-embedding".to_string(),
+        cors_allowed_origins: vec!["http://localhost:5175".to_string()],
+        llm_request_timeout_secs: 120,
+        llm_connect_timeout_secs: 10,
+        llm_pool_max_idle_per_host: 20,
+        llm_pool_idle_timeout_secs: 90,
+        llm_circuit_breaker_failure_threshold: 5,
+        llm_circuit_breaker_open_duration_secs: 30,
         bias_threshold: 0.35,
         max_input_length: 4096,
         semantic_medium_threshold: 0.70,

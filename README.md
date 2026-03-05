@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/Rust-1.70%2B-blue)](https://www.rust-lang.org/)
 
-A comprehensive framework for safe, compliant, and ethical AI interactions with Mistral AI models.
+A comprehensive framework for safe, compliant, and ethical AI interactions with provider-agnostic LLM backends (Mistral default).
 
 ## Features
 
@@ -11,7 +11,8 @@ A comprehensive framework for safe, compliant, and ethical AI interactions with 
 - **Bias Detection**: Analyzes prompts for potential biases
 - **EU AI Act Compliance**: Ensures compliance with EU regulations
 - **Audit Logging**: Comprehensive audit trail for all operations
-- **Mistral Integration**: Seamless integration with Mistral AI services
+- **Provider-Agnostic LLM Layer**: OpenAI-compatible and Anthropic-compatible backend support
+- **Production Hardening**: Health probes, circuit breaker, secure headers, and configurable CORS allowlist
 
 ## Quick Start
 
@@ -24,7 +25,8 @@ cd prompt_sentinel
 cargo build --release
 
 # Set environment variables
-export MISTRAL_API_KEY="your-api-key"
+export LLM_API_KEY="your-api-key"
+export LLM_BACKEND="openai_compat"
 export RUST_LOG="info"
 
 # Run the server
@@ -37,7 +39,7 @@ cargo run --release
 
 - Rust 1.85 or higher
 - Cargo package manager
-- Mistral API key (for full functionality)
+- LLM provider API key (for full functionality)
 
 ### Build from Source
 
@@ -61,7 +63,8 @@ docker build -t prompt-sentinel .
 # Run container
 docker run -d \
   -p 3000:3000 \
-  -e MISTRAL_API_KEY="your-api-key" \
+  -e LLM_API_KEY="your-api-key" \
+  -e LLM_BACKEND="openai_compat" \
   -e RUST_LOG="info" \
   --name prompt-sentinel \
   prompt-sentinel
@@ -73,7 +76,19 @@ docker run -d \
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `MISTRAL_API_KEY` | Mistral AI API key | None (required) |
+| `LLM_BACKEND` | `openai_compat`, `anthropic_compat`, `ollama`, `vllm` | `openai_compat` |
+| `LLM_API_KEY` | API key for remote providers | None |
+| `LLM_BASE_URL` | Override provider base URL | Backend-specific |
+| `LLM_GENERATION_MODEL` | Generation model id | Backend-specific |
+| `LLM_MODERATION_MODEL` | Moderation model id | Backend-specific |
+| `LLM_EMBEDDING_MODEL` | Embedding model id | Backend-specific |
+| `CORS_ALLOW_ORIGINS` | Comma-separated CORS allowlist | `http://localhost:5175,http://127.0.0.1:5175` |
+| `LLM_REQUEST_TIMEOUT_SECS` | Upstream request timeout | `120` |
+| `LLM_CONNECT_TIMEOUT_SECS` | Upstream connect timeout | `10` |
+| `LLM_POOL_MAX_IDLE_PER_HOST` | Upstream HTTP pool tuning | `20` |
+| `LLM_POOL_IDLE_TIMEOUT_SECS` | Upstream idle connection timeout | `90` |
+| `LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | Consecutive failures before open | `5` |
+| `LLM_CIRCUIT_BREAKER_OPEN_DURATION_SECS` | Circuit open window | `30` |
 | `RUST_LOG` | Logging level | `info` |
 | `SERVER_PORT` | Server port | `3000` |
 | `SLED_DB_PATH` | Database path | `prompt_sentinel_data` |
@@ -182,13 +197,23 @@ Check a prompt for compliance with all framework rules.
 
 ### GET /health
 
-Health check endpoint.
+Readiness check endpoint.
 
-**Response:** `OK`
+### GET /health/live
 
-### GET /api/mistral/health
+Liveness probe endpoint.
 
-Check Mistral API integration health.
+### GET /health/ready
+
+Readiness probe endpoint.
+
+### GET /health/startup
+
+Startup probe endpoint.
+
+### GET /api/llm/health (alias: `/api/mistral/health`)
+
+Check LLM provider integration health.
 
 **Response:**
 ```json

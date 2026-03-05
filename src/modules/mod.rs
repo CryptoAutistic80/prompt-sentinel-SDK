@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod bias_detection;
 pub mod eu_law_compliance;
+pub mod llm;
 pub mod mistral_ai;
 pub mod prompt_firewall;
 pub mod semantic_detection;
