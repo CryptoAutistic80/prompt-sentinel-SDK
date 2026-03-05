@@ -1524,6 +1524,7 @@ mod tests {
     use crate::workflow::ComplianceEngine;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::thread::sleep;
     use tower::ServiceExt;
 
@@ -2076,6 +2077,150 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn pentest_api_oidc_mixed_scope_tenant_and_resource_mismatch_is_denied() {
+        let mut settings = pentest_settings("unused", vec!["audit:read"]);
+        settings.auth_api_keys = Vec::new();
+        settings.oidc_enabled = true;
+        settings.oidc_allow_insecure_jwt_parse = true;
+        settings.tenant_isolation_enabled = true;
+        settings.tenant_require_workspace = true;
+        let app = build_test_router(settings, None);
+
+        let token = insecure_jwt_token(serde_json::json!({
+            "sub": "oidc-user-1",
+            "tenant_id": "tenant-a",
+            "roles": ["developer"],
+            "scope": "audit:read:project:alpha:env:prod"
+        }));
+        let auth_header = format!("Bearer {token}");
+        let response = send_post(
+            &app,
+            "/api/audit/trail",
+            &[
+                ("authorization", auth_header.as_str()),
+                ("x-tenant-id", "tenant-a"),
+                ("x-workspace-id", "workspace-prod"),
+                ("x-project-id", "alpha"),
+                ("x-environment", "staging"),
+            ],
+            serde_json::json!({
+                "limit": 10,
+                "offset": 0
+            }),
+        )
+        .await;
+
+        let status = response.status();
+        let body = response_body_text(response).await.to_ascii_lowercase();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("forbidden"));
+    }
+
+    #[tokio::test]
+    async fn pentest_api_oidc_mixed_scope_tenant_and_resource_match_is_allowed() {
+        let mut settings = pentest_settings("unused", vec!["audit:read"]);
+        settings.auth_api_keys = Vec::new();
+        settings.oidc_enabled = true;
+        settings.oidc_allow_insecure_jwt_parse = true;
+        settings.tenant_isolation_enabled = true;
+        settings.tenant_require_workspace = true;
+        let app = build_test_router(settings, None);
+
+        let token = insecure_jwt_token(serde_json::json!({
+            "sub": "oidc-user-1",
+            "tenant_id": "tenant-a",
+            "roles": ["developer"],
+            "scope": "audit:read:project:alpha:env:prod"
+        }));
+        let auth_header = format!("Bearer {token}");
+        let response = send_post(
+            &app,
+            "/api/audit/trail",
+            &[
+                ("authorization", auth_header.as_str()),
+                ("x-tenant-id", "tenant-a"),
+                ("x-workspace-id", "workspace-prod"),
+                ("x-project-id", "alpha"),
+                ("x-environment", "prod"),
+            ],
+            serde_json::json!({
+                "limit": 10,
+                "offset": 0
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn pentest_api_mtls_mixed_scope_tenant_and_resource_mismatch_is_denied() {
+        let mut settings = pentest_settings("unused", vec!["audit:read"]);
+        settings.auth_api_keys = Vec::new();
+        settings.mtls_enabled = true;
+        settings.mtls_allowed_subjects = vec!["CN=svc-compliance".to_string()];
+        settings.mtls_scopes = vec!["audit:read:project:alpha:env:prod".to_string()];
+        settings.tenant_isolation_enabled = true;
+        settings.tenant_require_workspace = true;
+        let app = build_test_router(settings, None);
+
+        let response = send_post(
+            &app,
+            "/api/audit/trail",
+            &[
+                ("x-client-cert-verified", "SUCCESS"),
+                ("x-client-cert-subject", "CN=svc-compliance"),
+                ("x-tenant-id", "tenant-a"),
+                ("x-workspace-id", "workspace-prod"),
+                ("x-project-id", "alpha"),
+                ("x-environment", "staging"),
+            ],
+            serde_json::json!({
+                "limit": 10,
+                "offset": 0
+            }),
+        )
+        .await;
+
+        let status = response.status();
+        let body = response_body_text(response).await.to_ascii_lowercase();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("forbidden"));
+    }
+
+    #[tokio::test]
+    async fn pentest_api_mtls_mixed_scope_tenant_and_resource_match_is_allowed() {
+        let mut settings = pentest_settings("unused", vec!["audit:read"]);
+        settings.auth_api_keys = Vec::new();
+        settings.mtls_enabled = true;
+        settings.mtls_allowed_subjects = vec!["CN=svc-compliance".to_string()];
+        settings.mtls_scopes = vec!["audit:read:project:alpha:env:prod".to_string()];
+        settings.tenant_isolation_enabled = true;
+        settings.tenant_require_workspace = true;
+        let app = build_test_router(settings, None);
+
+        let response = send_post(
+            &app,
+            "/api/audit/trail",
+            &[
+                ("x-client-cert-verified", "SUCCESS"),
+                ("x-client-cert-subject", "CN=svc-compliance"),
+                ("x-tenant-id", "tenant-a"),
+                ("x-workspace-id", "workspace-prod"),
+                ("x-project-id", "alpha"),
+                ("x-environment", "prod"),
+            ],
+            serde_json::json!({
+                "limit": 10,
+                "offset": 0
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     fn test_auth_context(tenant_id: Option<&str>, workspace_id: Option<&str>) -> AuthContext {
         AuthContext {
             principal_id: "principal".to_string(),
@@ -2245,6 +2390,19 @@ mod tests {
             .oneshot(request)
             .await
             .expect("router should respond")
+    }
+
+    fn insecure_jwt_token(payload: serde_json::Value) -> String {
+        let header = serde_json::json!({
+            "alg": "none",
+            "typ": "JWT"
+        });
+        let header_segment = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&header).expect("jwt header should serialize"));
+        let payload_segment = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).expect("jwt payload should serialize"));
+
+        format!("{header_segment}.{payload_segment}.")
     }
 
     async fn response_body_text(response: axum::response::Response) -> String {

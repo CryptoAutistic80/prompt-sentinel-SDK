@@ -7,7 +7,7 @@ Execution Mode: Phase-by-phase production hardening
 
 ## Current Stage Outcome
 
-This stage advanced **Phase 2 tenant identity hardening** by binding API/service credentials to tenant/workspace scope, enforcing those bindings in auth middleware, and proving that tenant/workspace switching via headers is denied.
+This stage advanced **Phase 2 OIDC/mTLS isolation parity hardening** by adding mixed tenant/workspace + project/environment adversarial API tests for OIDC and mTLS principals, and by enforcing fail-closed OIDC permission semantics when explicit scopes are present.
 
 ### Completed to date in this phase
 
@@ -204,6 +204,16 @@ This stage advanced **Phase 2 tenant identity hardening** by binding API/service
 - Extended auth bootstrap format docs:
   - `AUTH_API_KEYS` now supports optional `@tenant_id[/workspace_id]` suffix
   - auth key generate/rotate request schemas now document optional `tenant_id` + `workspace_id`
+- Added API-level mixed-scope adversarial tests for OIDC principals on `/api/audit/trail`:
+  - explicit OIDC resource scope mismatch (`project/environment`) is denied
+  - matching OIDC resource scope + tenant/workspace headers is allowed
+- Added API-level mixed-scope adversarial tests for mTLS principals on `/api/audit/trail`:
+  - explicit mTLS resource scope mismatch (`project/environment`) is denied
+  - matching mTLS resource scope + tenant/workspace headers is allowed
+- Hardened OIDC scope precedence behavior:
+  - when OIDC token provides explicit `scopes`, authorization no longer falls back to role defaults
+  - prevents scope-constrained OIDC tokens from unintentionally inheriting broader role permissions
+- Added OIDC unit regression coverage proving explicit scopes do not role-fallback.
 
 ## Phase Status Dashboard
 
@@ -211,7 +221,7 @@ This stage advanced **Phase 2 tenant identity hardening** by binding API/service
 |---|---|---|
 | Phase 0 - Foundation Hardening | In Progress | Core security/reliability foundations implemented; OTel/Sentry/chaos/contract testing remain. |
 | Phase 1 - Provider-Agnostic LLM Support | In Progress | Provider abstraction + backend switching implemented; routing/fallback/cost optimization pending. |
-| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + mTLS auth + durable auth access auditing + resource-level permission scaffold + tenant/workspace isolation baseline + first-pass tenant quota hooks + pluggable durable tenant quota backend (`memory`/`sled`) + tenant/workspace policy overlays + audit query isolation filters + audit residency metadata + runtime fail-closed residency checks + API-level adversarial isolation pentest suite + tenant/workspace-bound credential identity enforcement + CI isolation gates implemented. |
+| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + mTLS auth + durable auth access auditing + resource-level permission scaffold + tenant/workspace isolation baseline + first-pass tenant quota hooks + pluggable durable tenant quota backend (`memory`/`sled`) + tenant/workspace policy overlays + audit query isolation filters + audit residency metadata + runtime fail-closed residency checks + API-level adversarial isolation pentest suite + tenant/workspace-bound credential identity enforcement + OIDC/mTLS mixed-scope traversal tests + OIDC fail-closed scope precedence + CI isolation gates implemented. |
 | Phase 3 - Comprehensive EU AI Act Coverage | In Progress | Baseline classification exists; full article-by-article depth pending. |
 | Phase 4 - Audit Trail & Evidence Management | In Progress | Existing audit trail and proofs active; v2 schema + advanced exports/retention lifecycle pending. |
 | Phase 5 - Configuration & Rules Management | In Progress | Env-driven config active; hot reload/staged rollout/rollback/policy-as-code pending. |
@@ -290,32 +300,31 @@ This stage advanced **Phase 2 tenant identity hardening** by binding API/service
   - Tenant/workspace-bound API credentials with fail-closed header mismatch enforcement.
   - Credential lifecycle support for tenant/workspace bindings (generate/rotate/persist/list).
   - API-level pentest coverage for tenant-bound credential behavior.
+  - API-level OIDC/mTLS mixed-scope traversal regression cases (tenant/workspace + project/environment).
+  - OIDC explicit-scope precedence hardening (no role fallback when scopes are present).
   - Dedicated CI isolation/security regression workflow (`isolation-regressions.yml`).
 - Remaining:
-  - Expand E2E adversarial coverage for OIDC/mTLS principals and mixed project/environment resource-scope traversal.
   - Add revocation/rotation playbooks and migration guidance for moving existing unbound keys to bound-key posture.
+  - Add operational runbooks for OIDC/mTLS scope mismatch incidents and staged rollback controls.
 
 ## Validation
 
 Commands run for this stage:
 
-- `rustfmt --edition 2024 src/modules/auth/mod.rs src/server.rs src/config/settings.rs` -> pass
-- `cargo test tenant_bound_api_key -- --nocapture` -> pass
-- `cargo test workspace_bound_api_key -- --nocapture` -> pass
-- `cargo test pentest_api_tenant_bound_key -- --nocapture` -> pass
+- `rustfmt --edition 2024 src/modules/auth/mod.rs src/server.rs` -> pass
+- `cargo test oidc_explicit_scopes_do_not_fallback_to_role_defaults -- --nocapture` -> pass
+- `cargo test pentest_api_oidc_mixed_scope -- --nocapture` -> pass
+- `cargo test pentest_api_mtls_mixed_scope -- --nocapture` -> pass
 - `cargo test` -> pass (all suites green; benchmark test intentionally ignored)
 
 ## Files Changed This Stage
 
 - `src/server.rs`
 - `src/modules/auth/mod.rs`
-- `src/config/settings.rs`
-- `README.md`
-- `.env.example`
 - `PROGRESS_SUMMARY.md`
 
 ## Next Execution Slice
 
-1. Add OIDC + mTLS parity tests for mixed tenant/resource traversal (project/environment + tenant/workspace combinations).
-2. Implement migration tooling/guide to rotate legacy unbound credentials into bound tenant/workspace credentials safely.
-3. Add runbooks for credential-scope mismatch incidents (detection, rollback, and tenant impact triage).
+1. Implement migration tooling/guide to rotate legacy unbound credentials into bound tenant/workspace credentials safely.
+2. Add operator runbooks for credential/OIDC/mTLS scope mismatch incidents (detection, rollback, tenant impact triage).
+3. Add release-gate checks that fail deployments with high-risk unbound credentials in production mode.

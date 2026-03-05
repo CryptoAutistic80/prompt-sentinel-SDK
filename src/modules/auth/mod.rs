@@ -2044,12 +2044,11 @@ fn role_and_scopes_have_any_permission(
 }
 
 fn principal_has_permission(principal: &OidcPrincipal, required: &str) -> bool {
-    if principal
-        .scopes
-        .iter()
-        .any(|scope| permission_match(scope, required))
-    {
-        return true;
+    if !principal.scopes.is_empty() {
+        return principal
+            .scopes
+            .iter()
+            .any(|scope| permission_match(scope, required));
     }
 
     principal.roles.iter().any(|role| {
@@ -2734,6 +2733,38 @@ mod tests {
 
         assert_eq!(context.role, "developer");
         assert_eq!(context.principal_id, "oidc_user-1");
+    }
+
+    #[test]
+    fn oidc_explicit_scopes_do_not_fallback_to_role_defaults() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+
+        let service = AuthService::from_settings_with_oidc_verifier(
+            &settings,
+            Some(Arc::new(StaticOidcVerifier {
+                principal: OidcPrincipal {
+                    subject: "user-1".to_string(),
+                    issuer: Some("https://issuer.example.com".to_string()),
+                    email: Some("user@example.com".to_string()),
+                    tenant_id: Some("tenant-1".to_string()),
+                    provider: OidcProvider::Generic,
+                    roles: vec!["developer".to_string()],
+                    scopes: vec!["llm:read".to_string()],
+                },
+            })),
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyIn0."
+                .parse()
+                .expect("header"),
+        );
+
+        let result = service.authorize_request(&headers, &Method::POST, "/api/audit/trail");
+        assert!(matches!(result, Err(AuthError::Forbidden { .. })));
     }
 
     #[test]
