@@ -62,6 +62,8 @@ pub struct AppSettings {
     pub auth_api_keys: Vec<AuthCredentialConfig>,
     pub auth_service_tokens: Vec<AuthCredentialConfig>,
     pub auth_rate_limit_per_minute: u32,
+    pub auth_key_store_path: Option<String>,
+    pub auth_default_key_expiry_secs: Option<u64>,
     pub bias_threshold: f32,
     pub max_input_length: usize,
     /// Threshold for semantic Low/Medium boundary (default: 0.70)
@@ -134,6 +136,8 @@ impl AppSettings {
             auth_api_keys: parse_auth_credentials("AUTH_API_KEYS"),
             auth_service_tokens: parse_auth_credentials("AUTH_SERVICE_TOKENS"),
             auth_rate_limit_per_minute: parse_env_u32("AUTH_RATE_LIMIT_PER_MINUTE", 300)?,
+            auth_key_store_path: parse_env_optional_string("AUTH_KEY_STORE_PATH"),
+            auth_default_key_expiry_secs: parse_env_optional_u64("AUTH_DEFAULT_KEY_EXPIRY_SECS")?,
             bias_threshold,
             max_input_length,
             semantic_medium_threshold,
@@ -238,6 +242,17 @@ fn parse_env_bool(key: &str, default: bool) -> bool {
     }
 }
 
+fn parse_env_optional_string(key: &str) -> Option<String> {
+    env::var(key).ok().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    })
+}
+
 fn parse_env_f32(key: &str, default: f32) -> Result<f32, SettingsError> {
     match env::var(key) {
         Ok(value) => value
@@ -295,6 +310,31 @@ fn parse_env_u64(key: &str, default: u64) -> Result<u64, SettingsError> {
                 source,
             }),
         Err(_) => Ok(default),
+    }
+}
+
+fn parse_env_optional_u64(key: &str) -> Result<Option<u64>, SettingsError> {
+    match env::var(key) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+
+            let parsed = trimmed
+                .parse::<u64>()
+                .map_err(|source| SettingsError::ParseInt {
+                    key: key.to_owned(),
+                    source,
+                })?;
+
+            if parsed == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(parsed))
+            }
+        }
+        Err(_) => Ok(None),
     }
 }
 

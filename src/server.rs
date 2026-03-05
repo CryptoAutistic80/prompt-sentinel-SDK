@@ -23,7 +23,9 @@ use crate::modules::audit::logger::AuditLogger;
 use crate::modules::audit::storage::{
     AuditStorage, AuditTrailRequest, AuditTrailResponse, SledAuditStorage,
 };
-use crate::modules::auth::{AuthAdminError, AuthError, AuthService, RotateCredentialCommand};
+use crate::modules::auth::{
+    AuthAdminError, AuthError, AuthService, GenerateCredentialCommand, RotateCredentialCommand,
+};
 use crate::modules::bias_detection::service::BiasDetectionService;
 use crate::modules::eu_law_compliance::dtos::{
     ComplianceConfigurationRequest, ComplianceConfigurationResponse, ComplianceReportRequest,
@@ -148,9 +150,10 @@ async fn auth_middleware(
         Ok(None) => next.run(request).await,
         Err(error) => {
             let (status, code) = match &error {
-                AuthError::MissingCredentials | AuthError::InvalidCredentials => {
-                    (StatusCode::UNAUTHORIZED, "unauthorized")
-                }
+                AuthError::MissingCredentials
+                | AuthError::InvalidCredentials
+                | AuthError::ExpiredCredentials
+                | AuthError::RevokedCredentials => (StatusCode::UNAUTHORIZED, "unauthorized"),
                 AuthError::Forbidden { .. } => (StatusCode::FORBIDDEN, "forbidden"),
                 AuthError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
                 AuthError::InternalError => (StatusCode::INTERNAL_SERVER_ERROR, "auth_internal"),
@@ -231,7 +234,10 @@ impl PromptSentinelServer {
             .route("/api/llm/health", get(llm_health_check))
             .route("/v1/models", get(validate_models))
             .route("/api/auth/keys", get(list_auth_keys))
+            .route("/api/auth/keys/generate", post(generate_auth_key))
             .route("/api/auth/keys/rotate", post(rotate_auth_key))
+            .route("/api/auth/keys/revoke", post(revoke_auth_key))
+            .route("/api/auth/keys/expire", post(expire_auth_key))
             .route("/api/auth/access-log", get(get_auth_access_log))
             .route("/api/audit/trail", post(get_audit_trail))
             .route("/api/compliance/report", post(generate_compliance_report))
@@ -420,6 +426,21 @@ struct RotateAuthKeyRequest {
     scopes: Option<Vec<String>>,
     label: Option<String>,
     is_service_account: Option<bool>,
+    expires_in_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GenerateAuthKeyRequest {
+    role: String,
+    scopes: Option<Vec<String>>,
+    label: Option<String>,
+    is_service_account: Option<bool>,
+    expires_in_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyLifecycleRequest {
+    key_id: String,
 }
 
 async fn list_auth_keys(
@@ -449,12 +470,65 @@ async fn rotate_auth_key(
             scopes: request.scopes,
             label: request.label,
             is_service_account: request.is_service_account,
+            expires_in_seconds: request.expires_in_seconds,
         })
         .map_err(map_auth_admin_error)?;
 
     Ok(Json(serde_json::json!({
         "status": "rotated",
         "credential": updated,
+    })))
+}
+
+async fn generate_auth_key(
+    State(state): State<AppState>,
+    Json(request): Json<GenerateAuthKeyRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let generated = state
+        .auth_service
+        .generate_credential(GenerateCredentialCommand {
+            role: request.role,
+            scopes: request.scopes.unwrap_or_default(),
+            label: request.label,
+            is_service_account: request.is_service_account.unwrap_or(false),
+            expires_in_seconds: request.expires_in_seconds,
+        })
+        .map_err(map_auth_admin_error)?;
+
+    Ok(Json(serde_json::json!({
+        "status": "generated",
+        "token": generated.token,
+        "credential": generated.credential,
+    })))
+}
+
+async fn revoke_auth_key(
+    State(state): State<AppState>,
+    Json(request): Json<KeyLifecycleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let credential = state
+        .auth_service
+        .revoke_credential(&request.key_id)
+        .map_err(map_auth_admin_error)?;
+
+    Ok(Json(serde_json::json!({
+        "status": "revoked",
+        "credential": credential,
+    })))
+}
+
+async fn expire_auth_key(
+    State(state): State<AppState>,
+    Json(request): Json<KeyLifecycleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let credential = state
+        .auth_service
+        .expire_credential(&request.key_id)
+        .map_err(map_auth_admin_error)?;
+
+    Ok(Json(serde_json::json!({
+        "status": "expired",
+        "credential": credential,
     })))
 }
 
@@ -478,8 +552,13 @@ fn map_auth_admin_error(error: AuthAdminError) -> (StatusCode, String) {
         AuthAdminError::NotEnabled => (StatusCode::BAD_REQUEST, error.to_string()),
         AuthAdminError::CredentialNotFound => (StatusCode::NOT_FOUND, error.to_string()),
         AuthAdminError::NewTokenAlreadyExists => (StatusCode::CONFLICT, error.to_string()),
+        AuthAdminError::TokenGenerationFailed => {
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        }
         AuthAdminError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, error.to_string()),
-        AuthAdminError::StoragePoisoned => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        AuthAdminError::StoragePoisoned | AuthAdminError::PersistenceFailed(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        }
     }
 }
 
@@ -613,6 +692,8 @@ impl FrameworkConfig {
             auth_api_keys: Vec::new(),
             auth_service_tokens: Vec::new(),
             auth_rate_limit_per_minute: 300,
+            auth_key_store_path: Some("prompt_sentinel_data/auth_keys.json".to_string()),
+            auth_default_key_expiry_secs: None,
             bias_threshold: 0.35,
             max_input_length: 4096,
             semantic_medium_threshold: 0.70,

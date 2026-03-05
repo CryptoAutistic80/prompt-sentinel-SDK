@@ -7,29 +7,32 @@ Execution Mode: Phase-by-phase production hardening
 
 ## Current Stage Outcome
 
-This stage advanced **Phase 2 bootstrap** while preserving the earlier Phase 0/1 hardening work.
+This stage advanced **Phase 2 key lifecycle hardening** on top of the existing auth/RBAC bootstrap.
 
 ### Completed in this stage
 
-- Added API key authentication middleware for protected API routes.
-- Added RBAC permission checks by route + method.
-- Added per-key scope support (scope override beyond role defaults).
-- Added support for service account tokens.
-- Added per-key rate limiting (requests/minute window).
-- Added runtime credential rotation support (no restart) via auth admin endpoint.
-- Added auth access audit log (allow/deny decisions, principal, path, method).
-- Added auth configuration via env:
-  - `AUTH_ENABLED`
-  - `AUTH_API_KEYS`
-  - `AUTH_SERVICE_TOKENS`
-  - `AUTH_RATE_LIMIT_PER_MINUTE`
-- Added new auth module with unit tests.
-- Updated server wiring to enforce auth only on protected endpoints while keeping health probes open.
-- Added protected auth admin APIs:
-  - `GET /api/auth/keys`
-  - `POST /api/auth/keys/rotate`
-  - `GET /api/auth/access-log`
-- Updated docs/examples (`README.md`, `.env.example`) for scoped token format.
+- Added credential lifecycle operations in auth service:
+  - generate credential tokens
+  - revoke credentials by `key_id`
+  - expire credentials by `key_id`
+- Added key expiry + revocation enforcement in request authorization.
+- Added default key TTL support for generated credentials (`AUTH_DEFAULT_KEY_EXPIRY_SECS`).
+- Added persistent file-backed auth credential storage (`AUTH_KEY_STORE_PATH`) so key lifecycle changes survive restarts.
+- Added credential metadata state fields:
+  - `expires_at`
+  - `revoked_at`
+  - `active`
+- Extended auth admin APIs:
+  - `POST /api/auth/keys/generate`
+  - `POST /api/auth/keys/revoke`
+  - `POST /api/auth/keys/expire`
+  - existing `POST /api/auth/keys/rotate` now also accepts `expires_in_seconds`
+- Updated server auth error handling for revoked/expired tokens.
+- Added auth unit tests for:
+  - expiry and revoke enforcement
+  - generated key persistence round-trip
+  - default expiry behavior
+- Updated docs/examples (`README.md`, `.env.example`) for lifecycle endpoints and new env vars.
 
 ## Phase Status Dashboard
 
@@ -37,7 +40,7 @@ This stage advanced **Phase 2 bootstrap** while preserving the earlier Phase 0/1
 |---|---|---|
 | Phase 0 - Foundation Hardening | In Progress | Core security/reliability foundations implemented; OTel/Sentry/chaos/contract testing remain. |
 | Phase 1 - Provider-Agnostic LLM Support | In Progress | Provider abstraction + backend switching implemented; routing/fallback/cost optimization pending. |
-| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting implemented; OAuth/OIDC/mTLS/multi-tenant isolation pending. |
+| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence implemented; OAuth/OIDC/mTLS/multi-tenant isolation pending. |
 | Phase 3 - Comprehensive EU AI Act Coverage | In Progress | Baseline classification exists; full article-by-article depth pending. |
 | Phase 4 - Audit Trail & Evidence Management | In Progress | Existing audit trail and proofs active; v2 schema + advanced exports/retention lifecycle pending. |
 | Phase 5 - Configuration & Rules Management | In Progress | Env-driven config active; hot reload/staged rollout/rollback/policy-as-code pending. |
@@ -89,10 +92,11 @@ This stage advanced **Phase 2 bootstrap** while preserving the earlier Phase 0/1
   - RBAC route permission checks.
   - Per-key scopes.
   - Per-key rate limiting.
-  - Runtime credential rotation.
+  - Runtime credential generation/rotation/revoke/expire workflows.
+  - Credential expiry + revoke enforcement at auth middleware boundary.
+  - Persistent file-backed auth key store.
   - Auth access log retrieval.
 - Remaining:
-  - Key generation/expiry/rotation workflows.
   - OAuth 2.0 / OIDC integrations.
   - mTLS auth support.
   - Resource-level permissions.
@@ -110,7 +114,6 @@ Commands run for this stage:
 ## Files Changed This Stage
 
 - `src/modules/auth/mod.rs`
-- `src/modules/mod.rs`
 - `src/config/settings.rs`
 - `src/server.rs`
 - `tests/multilingual_response_test.rs`
@@ -120,6 +123,6 @@ Commands run for this stage:
 
 ## Next Execution Slice
 
-1. Add key lifecycle management APIs (generate, expire, revoke) with persistent storage backend.
-2. Start OAuth/OIDC provider abstraction (Auth0/Okta/Azure AD/Keycloak-ready).
-3. Persist auth access audit events into the main audit evidence layer.
+1. Start OAuth/OIDC provider abstraction (Auth0/Okta/Azure AD/Keycloak-ready) with pluggable verifier interfaces.
+2. Persist auth access audit events into the main audit evidence layer (durable and queryable).
+3. Introduce resource-level permissions scaffold (project/environment dimension) as the first multi-tenant control.

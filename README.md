@@ -94,6 +94,8 @@ docker run -d \
 | `AUTH_API_KEYS` | Comma-separated `token:role[:scope1\|scope2]` values | None |
 | `AUTH_SERVICE_TOKENS` | Comma-separated service tokens in same format | None |
 | `AUTH_RATE_LIMIT_PER_MINUTE` | Per-key request limit per 60s | `300` |
+| `AUTH_KEY_STORE_PATH` | Persistent auth key store path | `prompt_sentinel_data/auth_keys.json` |
+| `AUTH_DEFAULT_KEY_EXPIRY_SECS` | Default TTL (seconds) for generated keys | None |
 | `RUST_LOG` | Logging level | `info` |
 | `SERVER_PORT` | Server port | `3000` |
 | `SLED_DB_PATH` | Database path | `prompt_sentinel_data` |
@@ -233,6 +235,21 @@ Check LLM provider integration health.
 
 List current auth credential metadata (token values are never returned).
 
+### POST /api/auth/keys/generate
+
+Generate a new API credential. The plaintext `token` is returned only once.
+
+**Request:**
+```json
+{
+  "role": "developer",
+  "scopes": ["check:invoke", "audit:read"],
+  "label": "ci-staging",
+  "is_service_account": true,
+  "expires_in_seconds": 3600
+}
+```
+
 ### POST /api/auth/keys/rotate
 
 Rotate a credential without restarting the server.
@@ -243,7 +260,30 @@ Rotate a credential without restarting the server.
   "old_token": "old-api-token",
   "new_token": "new-api-token",
   "role": "developer",
-  "scopes": ["check:invoke", "audit:read"]
+  "scopes": ["check:invoke", "audit:read"],
+  "expires_in_seconds": 86400
+}
+```
+
+### POST /api/auth/keys/revoke
+
+Revoke a credential by `key_id`.
+
+**Request:**
+```json
+{
+  "key_id": "key_123abc456def"
+}
+```
+
+### POST /api/auth/keys/expire
+
+Expire a credential immediately by `key_id`.
+
+**Request:**
+```json
+{
+  "key_id": "key_123abc456def"
 }
 ```
 
