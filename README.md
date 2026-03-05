@@ -96,6 +96,14 @@ docker run -d \
 | `AUTH_RATE_LIMIT_PER_MINUTE` | Per-key request limit per 60s | `300` |
 | `AUTH_KEY_STORE_PATH` | Persistent auth key store path | `prompt_sentinel_data/auth_keys.json` |
 | `AUTH_DEFAULT_KEY_EXPIRY_SECS` | Default TTL (seconds) for generated keys | None |
+| `OIDC_ENABLED` | Enable OIDC bearer-token verification path | `false` |
+| `OIDC_PROVIDER` | `generic`, `auth0`, `okta`, `azure_ad`, `keycloak` | `generic` |
+| `OIDC_ISSUER_URL` | Expected JWT issuer (`iss`) | None |
+| `OIDC_AUDIENCE` | Expected audience (`aud`) | None |
+| `OIDC_CLIENT_ID` | Expected client id audience match | None |
+| `OIDC_ROLES_CLAIM` | JWT claim containing role list | `roles` |
+| `OIDC_SCOPES_CLAIM` | JWT claim containing scopes | `scope` |
+| `OIDC_ALLOW_INSECURE_JWT_PARSE` | Dev-only claim parsing without signature verification | `false` |
 | `RUST_LOG` | Logging level | `info` |
 | `SERVER_PORT` | Server port | `3000` |
 | `SLED_DB_PATH` | Database path | `prompt_sentinel_data` |
@@ -234,6 +242,11 @@ Check LLM provider integration health.
 ### GET /api/auth/keys
 
 List current auth credential metadata (token values are never returned).
+
+### OIDC Bearer Auth (Bootstrap)
+
+When `OIDC_ENABLED=true`, `Authorization: Bearer <jwt>` requests are evaluated through the OIDC verifier abstraction (`generic` / `auth0` / `okta` / `azure_ad` / `keycloak` provider configs).  
+This stage includes the pluggable interface and a development-only claims parser gated behind `OIDC_ALLOW_INSECURE_JWT_PARSE=true`; production-grade signature validation is the next slice.
 
 ### POST /api/auth/keys/generate
 

@@ -7,7 +7,7 @@ Execution Mode: Phase-by-phase production hardening
 
 ## Current Stage Outcome
 
-This stage advanced **Phase 2 key lifecycle hardening** on top of the existing auth/RBAC bootstrap.
+This stage advanced **Phase 2 OAuth/OIDC abstraction bootstrap** on top of the existing key lifecycle hardening.
 
 ### Completed in this stage
 
@@ -18,6 +18,20 @@ This stage advanced **Phase 2 key lifecycle hardening** on top of the existing a
 - Added key expiry + revocation enforcement in request authorization.
 - Added default key TTL support for generated credentials (`AUTH_DEFAULT_KEY_EXPIRY_SECS`).
 - Added persistent file-backed auth credential storage (`AUTH_KEY_STORE_PATH`) so key lifecycle changes survive restarts.
+- Added pluggable OIDC verifier abstraction:
+  - provider enum (`generic`, `auth0`, `okta`, `azure_ad`, `keycloak`)
+  - verifier trait + principal model for bearer-token auth
+  - OIDC verifier builder wired from environment settings
+- Added OIDC bearer auth path in middleware-aligned auth flow while preserving API-key compatibility.
+- Added OIDC bootstrap settings:
+  - `OIDC_ENABLED`
+  - `OIDC_PROVIDER`
+  - `OIDC_ISSUER_URL`
+  - `OIDC_AUDIENCE`
+  - `OIDC_CLIENT_ID`
+  - `OIDC_ROLES_CLAIM`
+  - `OIDC_SCOPES_CLAIM`
+  - `OIDC_ALLOW_INSECURE_JWT_PARSE` (dev-only guardrail)
 - Added credential metadata state fields:
   - `expires_at`
   - `revoked_at`
@@ -32,6 +46,9 @@ This stage advanced **Phase 2 key lifecycle hardening** on top of the existing a
   - expiry and revoke enforcement
   - generated key persistence round-trip
   - default expiry behavior
+- Added OIDC-focused tests:
+  - JWT claims verifier behavior
+  - auth service bearer-token authorization via pluggable verifier
 - Updated docs/examples (`README.md`, `.env.example`) for lifecycle endpoints and new env vars.
 
 ## Phase Status Dashboard
@@ -40,7 +57,7 @@ This stage advanced **Phase 2 key lifecycle hardening** on top of the existing a
 |---|---|---|
 | Phase 0 - Foundation Hardening | In Progress | Core security/reliability foundations implemented; OTel/Sentry/chaos/contract testing remain. |
 | Phase 1 - Provider-Agnostic LLM Support | In Progress | Provider abstraction + backend switching implemented; routing/fallback/cost optimization pending. |
-| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence implemented; OAuth/OIDC/mTLS/multi-tenant isolation pending. |
+| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC abstraction bootstrap implemented; full OAuth/OIDC validation/mTLS/multi-tenant isolation pending. |
 | Phase 3 - Comprehensive EU AI Act Coverage | In Progress | Baseline classification exists; full article-by-article depth pending. |
 | Phase 4 - Audit Trail & Evidence Management | In Progress | Existing audit trail and proofs active; v2 schema + advanced exports/retention lifecycle pending. |
 | Phase 5 - Configuration & Rules Management | In Progress | Env-driven config active; hot reload/staged rollout/rollback/policy-as-code pending. |
@@ -95,9 +112,11 @@ This stage advanced **Phase 2 key lifecycle hardening** on top of the existing a
   - Runtime credential generation/rotation/revoke/expire workflows.
   - Credential expiry + revoke enforcement at auth middleware boundary.
   - Persistent file-backed auth key store.
+  - OIDC provider abstraction + bearer-token auth integration scaffolding.
   - Auth access log retrieval.
 - Remaining:
-  - OAuth 2.0 / OIDC integrations.
+  - Production-grade OAuth 2.0 / OIDC JWT signature validation and JWKS refresh.
+  - Provider-specific setup flows (Auth0/Okta/Azure AD/Keycloak).
   - mTLS auth support.
   - Resource-level permissions.
   - Access event audit expansion.
@@ -114,6 +133,7 @@ Commands run for this stage:
 ## Files Changed This Stage
 
 - `src/modules/auth/mod.rs`
+- `src/modules/auth/oidc.rs`
 - `src/config/settings.rs`
 - `src/server.rs`
 - `tests/multilingual_response_test.rs`
@@ -123,6 +143,6 @@ Commands run for this stage:
 
 ## Next Execution Slice
 
-1. Start OAuth/OIDC provider abstraction (Auth0/Okta/Azure AD/Keycloak-ready) with pluggable verifier interfaces.
+1. Replace dev-only OIDC claims parsing with production JWT signature validation + JWKS cache/rotation.
 2. Persist auth access audit events into the main audit evidence layer (durable and queryable).
 3. Introduce resource-level permissions scaffold (project/environment dimension) as the first multi-tenant control.

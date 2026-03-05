@@ -1,3 +1,5 @@
+pub mod oidc;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
@@ -12,6 +14,9 @@ use thiserror::Error;
 use tracing::warn;
 use uuid::Uuid;
 
+use self::oidc::{
+    OidcPrincipal, OidcTokenVerifier, OidcVerificationError, build_oidc_verifier, looks_like_jwt,
+};
 use crate::config::settings::{AppSettings, AuthCredentialConfig};
 
 const DEFAULT_ACCESS_LOG_LIMIT: usize = 200;
@@ -353,10 +358,19 @@ pub struct AuthService {
     access_events: Arc<Mutex<VecDeque<AccessAuditEvent>>>,
     credential_store: Option<CredentialStore>,
     default_key_expiry_secs: Option<u64>,
+    oidc_verifier: Option<Arc<dyn OidcTokenVerifier + Send + Sync>>,
 }
 
 impl AuthService {
     pub fn from_settings(settings: &AppSettings) -> Self {
+        let oidc_verifier = build_oidc_verifier(settings);
+        Self::from_settings_with_oidc_verifier(settings, oidc_verifier)
+    }
+
+    pub fn from_settings_with_oidc_verifier(
+        settings: &AppSettings,
+        oidc_verifier: Option<Arc<dyn OidcTokenVerifier + Send + Sync>>,
+    ) -> Self {
         let mut credentials = HashMap::new();
         register_credentials(&mut credentials, &settings.auth_api_keys, false);
         register_credentials(&mut credentials, &settings.auth_service_tokens, true);
@@ -411,6 +425,7 @@ impl AuthService {
             access_events: Arc::new(Mutex::new(VecDeque::new())),
             credential_store,
             default_key_expiry_secs: settings.auth_default_key_expiry_secs,
+            oidc_verifier,
         }
     }
 
@@ -432,7 +447,8 @@ impl AuthService {
         let method_str = method.as_str().to_owned();
         let path_str = path.to_owned();
 
-        let token = extract_token(headers).ok_or_else(|| {
+        let credentials = extract_credentials(headers);
+        if credentials.api_key.is_none() && credentials.bearer.is_none() {
             self.record_access(AccessAuditEvent {
                 timestamp: Utc::now(),
                 principal_id: None,
@@ -443,9 +459,45 @@ impl AuthService {
                 required_permission: required_permission.clone(),
                 detail: None,
             });
-            AuthError::MissingCredentials
-        })?;
+            return Err(AuthError::MissingCredentials);
+        }
 
+        if let Some(token) = credentials.api_key {
+            return self
+                .authorize_with_api_token(token, method, path, &required_permission)
+                .map(Some);
+        }
+
+        if let Some(token) = credentials.bearer {
+            if let Some(oidc_verifier) = &self.oidc_verifier
+                && looks_like_jwt(token)
+            {
+                return self
+                    .authorize_with_oidc_token(
+                        oidc_verifier.as_ref(),
+                        token,
+                        method,
+                        path,
+                        &required_permission,
+                    )
+                    .map(Some);
+            }
+
+            return self
+                .authorize_with_api_token(token, method, path, &required_permission)
+                .map(Some);
+        }
+
+        Err(AuthError::MissingCredentials)
+    }
+
+    fn authorize_with_api_token(
+        &self,
+        token: &str,
+        method: &Method,
+        path: &str,
+        required_permission: &Option<String>,
+    ) -> Result<AuthContext, AuthError> {
         let token_hash = hash_token(token);
         let entry = {
             let Ok(guard) = self.credentials.lock() else {
@@ -453,10 +505,10 @@ impl AuthService {
                     timestamp: Utc::now(),
                     principal_id: None,
                     role: None,
-                    method: method_str,
-                    path: path_str,
+                    method: method.as_str().to_owned(),
+                    path: path.to_owned(),
                     outcome: "deny_internal_error".to_string(),
-                    required_permission,
+                    required_permission: required_permission.clone(),
                     detail: Some("auth credential storage lock poisoned".to_string()),
                 });
                 return Err(AuthError::InternalError);
@@ -547,16 +599,106 @@ impl AuthService {
             method: method.as_str().to_owned(),
             path: path.to_owned(),
             outcome: "allow".to_string(),
-            required_permission,
-            detail: None,
+            required_permission: required_permission.clone(),
+            detail: Some("auth_mechanism=api_key".to_string()),
         });
 
-        Ok(Some(AuthContext {
+        Ok(AuthContext {
             principal_id: entry.key_id,
             role: entry.role,
             is_service_account: entry.is_service_account,
             scopes: entry.scopes,
-        }))
+        })
+    }
+
+    fn authorize_with_oidc_token(
+        &self,
+        verifier: &(dyn OidcTokenVerifier + Send + Sync),
+        token: &str,
+        method: &Method,
+        path: &str,
+        required_permission: &Option<String>,
+    ) -> Result<AuthContext, AuthError> {
+        let principal = verifier.verify(token).map_err(|error| {
+            let auth_error = match error {
+                OidcVerificationError::Expired => AuthError::ExpiredCredentials,
+                OidcVerificationError::NotYetValid
+                | OidcVerificationError::NotJwt
+                | OidcVerificationError::MissingSubject
+                | OidcVerificationError::IssuerMismatch
+                | OidcVerificationError::AudienceMismatch
+                | OidcVerificationError::InvalidPayload => AuthError::InvalidCredentials,
+                OidcVerificationError::Unavailable(_) => AuthError::InternalError,
+            };
+
+            self.record_access(AccessAuditEvent {
+                timestamp: Utc::now(),
+                principal_id: None,
+                role: None,
+                method: method.as_str().to_owned(),
+                path: path.to_owned(),
+                outcome: "deny_oidc_verification_failed".to_string(),
+                required_permission: required_permission.clone(),
+                detail: Some(error.to_string()),
+            });
+            auth_error
+        })?;
+
+        let principal_id = format!("oidc_{}", principal.subject);
+        if let Some(rate_limiter) = &self.rate_limiter
+            && !rate_limiter.allow(&principal_id)
+        {
+            self.record_access(AccessAuditEvent {
+                timestamp: Utc::now(),
+                principal_id: Some(principal_id),
+                role: Some(principal.primary_role().to_owned()),
+                method: method.as_str().to_owned(),
+                path: path.to_owned(),
+                outcome: "deny_rate_limited".to_string(),
+                required_permission: required_permission.clone(),
+                detail: Some("auth_mechanism=oidc".to_string()),
+            });
+            return Err(AuthError::RateLimited);
+        }
+
+        if let Some(permission) = required_permission.as_deref()
+            && !principal_has_permission(&principal, permission)
+        {
+            self.record_access(AccessAuditEvent {
+                timestamp: Utc::now(),
+                principal_id: Some(format!("oidc_{}", principal.subject)),
+                role: Some(principal.primary_role().to_owned()),
+                method: method.as_str().to_owned(),
+                path: path.to_owned(),
+                outcome: "deny_forbidden".to_string(),
+                required_permission: required_permission.clone(),
+                detail: Some(format!("missing required permission `{permission}`")),
+            });
+            return Err(AuthError::Forbidden {
+                required_permission: permission.to_owned(),
+            });
+        }
+
+        self.record_access(AccessAuditEvent {
+            timestamp: Utc::now(),
+            principal_id: Some(format!("oidc_{}", principal.subject)),
+            role: Some(principal.primary_role().to_owned()),
+            method: method.as_str().to_owned(),
+            path: path.to_owned(),
+            outcome: "allow".to_string(),
+            required_permission: required_permission.clone(),
+            detail: Some(format!(
+                "auth_mechanism=oidc; provider={}",
+                verifier.provider().as_str()
+            )),
+        });
+
+        Ok(AuthContext {
+            principal_id: format!("oidc_{}", principal.subject),
+            role: principal.primary_role().to_owned(),
+            is_service_account: false,
+            scopes: principal.scopes,
+        })
     }
 
     pub fn list_credentials(&self) -> Result<Vec<CredentialMetadata>, AuthAdminError> {
@@ -864,25 +1006,27 @@ fn register_credentials(
     }
 }
 
-fn extract_token(headers: &HeaderMap) -> Option<&str> {
-    if let Some(value) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        let token = value.trim();
-        if !token.is_empty() {
-            return Some(token);
-        }
-    }
+#[derive(Clone, Copy)]
+struct ExtractedCredentials<'a> {
+    api_key: Option<&'a str>,
+    bearer: Option<&'a str>,
+}
+
+fn extract_credentials(headers: &HeaderMap) -> ExtractedCredentials<'_> {
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
 
     let bearer = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)?;
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
 
-    if bearer.is_empty() {
-        None
-    } else {
-        Some(bearer)
-    }
+    ExtractedCredentials { api_key, bearer }
 }
 
 fn required_permission(method: &Method, path: &str) -> Option<&'static str> {
@@ -925,6 +1069,22 @@ fn permission_match(candidate: &str, required: &str) -> bool {
     }
 
     false
+}
+
+fn principal_has_permission(principal: &OidcPrincipal, required: &str) -> bool {
+    if principal
+        .scopes
+        .iter()
+        .any(|scope| permission_match(scope, required))
+    {
+        return true;
+    }
+
+    principal.roles.iter().any(|role| {
+        permissions_for_role(role)
+            .iter()
+            .any(|candidate| permission_match(candidate, required))
+    })
 }
 
 fn hash_token(token: &str) -> String {
@@ -1011,7 +1171,23 @@ fn generate_unique_token(
 
 #[cfg(test)]
 mod tests {
+    use super::oidc::{OidcProvider, OidcTokenVerifier, OidcVerificationError};
     use super::*;
+    use std::sync::Arc;
+
+    struct StaticOidcVerifier {
+        principal: OidcPrincipal,
+    }
+
+    impl OidcTokenVerifier for StaticOidcVerifier {
+        fn verify(&self, _token: &str) -> Result<OidcPrincipal, OidcVerificationError> {
+            Ok(self.principal.clone())
+        }
+
+        fn provider(&self) -> OidcProvider {
+            OidcProvider::Generic
+        }
+    }
 
     #[test]
     fn role_permissions_match_expected_behavior() {
@@ -1192,6 +1368,43 @@ mod tests {
         assert!(generated.credential.active);
     }
 
+    #[test]
+    fn oidc_bearer_token_can_authorize_by_scope() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+
+        let service = AuthService::from_settings_with_oidc_verifier(
+            &settings,
+            Some(Arc::new(StaticOidcVerifier {
+                principal: OidcPrincipal {
+                    subject: "user-1".to_string(),
+                    issuer: Some("https://issuer.example.com".to_string()),
+                    email: Some("user@example.com".to_string()),
+                    tenant_id: Some("tenant-1".to_string()),
+                    provider: OidcProvider::Generic,
+                    roles: vec!["developer".to_string()],
+                    scopes: vec!["check:invoke".to_string()],
+                },
+            })),
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyIn0."
+                .parse()
+                .expect("header"),
+        );
+
+        let result = service.authorize_request(&headers, &Method::POST, "/api/compliance/check");
+        let context = result
+            .expect("auth should succeed")
+            .expect("context should exist");
+
+        assert_eq!(context.role, "developer");
+        assert_eq!(context.principal_id, "oidc_user-1");
+    }
+
     fn test_settings() -> AppSettings {
         AppSettings {
             server_port: 3000,
@@ -1214,6 +1427,14 @@ mod tests {
             auth_rate_limit_per_minute: 60,
             auth_key_store_path: None,
             auth_default_key_expiry_secs: None,
+            oidc_enabled: false,
+            oidc_provider: "generic".to_string(),
+            oidc_issuer_url: None,
+            oidc_audience: None,
+            oidc_client_id: None,
+            oidc_roles_claim: "roles".to_string(),
+            oidc_scopes_claim: "scope".to_string(),
+            oidc_allow_insecure_jwt_parse: false,
             bias_threshold: 0.35,
             max_input_length: 1024,
             semantic_medium_threshold: 0.70,
