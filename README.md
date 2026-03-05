@@ -101,8 +101,8 @@ docker run -d \
 | `OIDC_ISSUER_URL` | Expected JWT issuer (`iss`) | None |
 | `OIDC_AUDIENCE` | Expected audience (`aud`) | None |
 | `OIDC_CLIENT_ID` | Expected client id audience match | None |
-| `OIDC_ROLES_CLAIM` | JWT claim containing role list | `roles` |
-| `OIDC_SCOPES_CLAIM` | JWT claim containing scopes | `scope` |
+| `OIDC_ROLES_CLAIM` | Role claim selector (`auto`, claim path, or comma list) | `auto` |
+| `OIDC_SCOPES_CLAIM` | Scope claim selector (`auto`, claim path, or comma list) | `auto` |
 | `OIDC_JWKS_URL` | OIDC JWKS endpoint for JWT signature verification | None |
 | `OIDC_JWKS_REFRESH_INTERVAL_SECS` | JWKS cache refresh interval | `300` |
 | `OIDC_CLOCK_SKEW_SECS` | JWT clock skew tolerance | `60` |
@@ -251,6 +251,16 @@ List current auth credential metadata (token values are never returned).
 When `OIDC_ENABLED=true`, `Authorization: Bearer <jwt>` requests are evaluated through the OIDC verifier abstraction (`generic` / `auth0` / `okta` / `azure_ad` / `keycloak` provider configs).  
 Secure mode validates JWT signatures against `OIDC_JWKS_URL` with an in-memory JWKS cache (`OIDC_JWKS_REFRESH_INTERVAL_SECS`) and clock-skew tolerance (`OIDC_CLOCK_SKEW_SECS`).  
 `OIDC_ALLOW_INSECURE_JWT_PARSE=true` is development-only and bypasses signature checks.
+
+Provider onboarding profiles (`OIDC_ROLES_CLAIM=auto`, `OIDC_SCOPES_CLAIM=auto`) map claims as follows:
+
+- `auth0`: scopes from `scope`, `permissions`, or namespaced `*/permissions`; roles from `roles` or namespaced `*/roles`
+- `okta`: scopes from `scp` or `scope`; roles from `groups` or `roles`
+- `azure_ad`: scopes from `scp` or `scope`; roles from `roles` or `groups`
+- `keycloak`: scopes from `scope` or `scp`; roles from `realm_access.roles` and `resource_access.{client_id}.roles`
+- `generic`: scopes from `scope`/`scp`; roles from `roles`/`groups`
+
+`OIDC_ROLES_CLAIM` and `OIDC_SCOPES_CLAIM` also accept explicit claim paths (for example `realm_access.roles`) or comma-separated candidates.
 
 ### POST /api/auth/keys/generate
 

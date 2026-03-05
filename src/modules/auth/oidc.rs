@@ -52,8 +52,8 @@ pub struct OidcVerifierConfig {
     pub issuer: Option<String>,
     pub audience: Option<String>,
     pub client_id: Option<String>,
-    pub scopes_claim: String,
-    pub roles_claim: String,
+    pub scopes_claims: Vec<String>,
+    pub roles_claims: Vec<String>,
     pub jwks_url: Option<String>,
     pub jwks_refresh_interval_secs: u64,
     pub clock_skew_secs: u64,
@@ -198,8 +198,12 @@ impl OidcTokenVerifier for InsecureJwtClaimVerifier {
             return Err(OidcVerificationError::NotYetValid);
         }
 
-        let scopes = payload.claim_as_scopes(&self.config.scopes_claim);
-        let roles = payload.claim_as_list(&self.config.roles_claim);
+        let scopes = payload.claim_as_scopes_candidates(
+            &self.config.scopes_claims,
+            self.config.client_id.as_deref(),
+        );
+        let roles = payload
+            .claim_as_list_candidates(&self.config.roles_claims, self.config.client_id.as_deref());
         let issuer = payload.iss.clone();
         let email = payload.email.clone();
         let tenant_id = payload.tenant_id();
@@ -294,8 +298,12 @@ impl OidcTokenVerifier for JwksJwtVerifier {
             .map(ToOwned::to_owned)
             .ok_or(OidcVerificationError::MissingSubject)?;
 
-        let scopes = claims.claim_as_scopes(&self.config.scopes_claim);
-        let roles = claims.claim_as_list(&self.config.roles_claim);
+        let scopes = claims.claim_as_scopes_candidates(
+            &self.config.scopes_claims,
+            self.config.client_id.as_deref(),
+        );
+        let roles = claims
+            .claim_as_list_candidates(&self.config.roles_claims, self.config.client_id.as_deref());
         let issuer = claims.iss.clone();
         let email = claims.email.clone();
         let tenant_id = claims.tenant_id();
@@ -346,13 +354,14 @@ pub fn build_oidc_verifier(
     }
 
     let provider = OidcProvider::from_config(&settings.oidc_provider);
+    let profile = profile_for_provider(&provider);
     let config = OidcVerifierConfig {
         provider: provider.clone(),
         issuer: settings.oidc_issuer_url.clone(),
         audience: settings.oidc_audience.clone(),
         client_id: settings.oidc_client_id.clone(),
-        scopes_claim: settings.oidc_scopes_claim.clone(),
-        roles_claim: settings.oidc_roles_claim.clone(),
+        scopes_claims: resolve_claim_candidates(&settings.oidc_scopes_claim, profile.scopes_claims),
+        roles_claims: resolve_claim_candidates(&settings.oidc_roles_claim, profile.roles_claims),
         jwks_url: settings.oidc_jwks_url.clone(),
         jwks_refresh_interval_secs: settings.oidc_jwks_refresh_interval_secs,
         clock_skew_secs: settings.oidc_clock_skew_secs,
@@ -372,6 +381,65 @@ pub fn build_oidc_verifier(
             Some(Arc::new(DisabledOidcVerifier::new(provider, error)))
         }
     }
+}
+
+struct OidcProfileClaims {
+    scopes_claims: &'static [&'static str],
+    roles_claims: &'static [&'static str],
+}
+
+fn profile_for_provider(provider: &OidcProvider) -> OidcProfileClaims {
+    match provider {
+        OidcProvider::Auth0 => OidcProfileClaims {
+            scopes_claims: &["scope", "permissions", "suffix:/permissions"],
+            roles_claims: &["roles", "suffix:/roles"],
+        },
+        OidcProvider::Okta => OidcProfileClaims {
+            scopes_claims: &["scp", "scope"],
+            roles_claims: &["groups", "roles"],
+        },
+        OidcProvider::AzureAd => OidcProfileClaims {
+            scopes_claims: &["scp", "scope"],
+            roles_claims: &["roles", "groups"],
+        },
+        OidcProvider::Keycloak => OidcProfileClaims {
+            scopes_claims: &["scope", "scp"],
+            roles_claims: &[
+                "realm_access.roles",
+                "resource_access.{client_id}.roles",
+                "roles",
+            ],
+        },
+        OidcProvider::Generic => OidcProfileClaims {
+            scopes_claims: &["scope", "scp"],
+            roles_claims: &["roles", "groups"],
+        },
+    }
+}
+
+fn resolve_claim_candidates(configured: &str, defaults: &[&str]) -> Vec<String> {
+    let configured = parse_claim_candidates(configured);
+    let mut merged = if configured.is_empty()
+        || (configured.len() == 1 && configured[0].eq_ignore_ascii_case("auto"))
+    {
+        defaults.iter().map(|claim| (*claim).to_string()).collect()
+    } else {
+        configured
+    };
+
+    push_unique(
+        &mut merged,
+        defaults.iter().map(|claim| (*claim).to_string()),
+    );
+    merged
+}
+
+fn parse_claim_candidates(raw: &str) -> Vec<String> {
+    raw.split([',', '|'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 struct JwksCacheState {
@@ -574,28 +642,72 @@ impl JwtClaims {
         }
     }
 
-    fn claim_as_list(&self, claim_name: &str) -> Vec<String> {
-        let Some(value) = self.custom.get(claim_name) else {
-            return Vec::new();
-        };
-
-        claim_value_to_list(value)
+    fn claim_as_list_candidates(
+        &self,
+        claim_names: &[String],
+        client_id: Option<&str>,
+    ) -> Vec<String> {
+        let mut values = Vec::new();
+        for claim_name in claim_names {
+            for value in self.claim_values_for_selector(claim_name, client_id) {
+                let candidates = claim_value_to_list(&value);
+                push_unique(&mut values, candidates);
+            }
+        }
+        values
     }
 
-    fn claim_as_scopes(&self, claim_name: &str) -> Vec<String> {
-        let Some(value) = self.custom.get(claim_name) else {
-            return Vec::new();
-        };
-
-        match value {
-            Value::String(scopes) => scopes
-                .split_whitespace()
-                .map(str::trim)
-                .filter(|scope| !scope.is_empty())
-                .map(ToOwned::to_owned)
-                .collect(),
-            _ => claim_value_to_list(value),
+    fn claim_as_scopes_candidates(
+        &self,
+        claim_names: &[String],
+        client_id: Option<&str>,
+    ) -> Vec<String> {
+        let mut values = Vec::new();
+        for claim_name in claim_names {
+            for value in self.claim_values_for_selector(claim_name, client_id) {
+                let candidates = match value {
+                    Value::String(scopes) => scopes
+                        .split_whitespace()
+                        .map(str::trim)
+                        .filter(|scope| !scope.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect(),
+                    _ => claim_value_to_list(&value),
+                };
+                push_unique(&mut values, candidates);
+            }
         }
+        values
+    }
+
+    fn claim_values_for_selector(&self, selector: &str, client_id: Option<&str>) -> Vec<Value> {
+        if let Some(suffix) = selector.strip_prefix("suffix:") {
+            return self
+                .custom
+                .iter()
+                .filter(|(key, _)| key.ends_with(suffix))
+                .map(|(_, value)| value.clone())
+                .collect();
+        }
+
+        self.claim_value_for_path(selector, client_id)
+            .into_iter()
+            .collect()
+    }
+
+    fn claim_value_for_path(&self, path: &str, client_id: Option<&str>) -> Option<Value> {
+        let resolved = resolve_claim_path(path, client_id)?;
+        let mut segments = resolved.split('.');
+        let first = segments.next()?;
+        let mut current = self.custom.get(first)?.clone();
+        for segment in segments {
+            let Value::Object(map) = current else {
+                return None;
+            };
+            current = map.get(segment)?.clone();
+        }
+
+        Some(current)
     }
 
     fn tenant_id(&self) -> Option<String> {
@@ -621,6 +733,31 @@ fn claim_value_to_list(value: &Value) -> Vec<String> {
             .map(ToOwned::to_owned)
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+fn resolve_claim_path(path: &str, client_id: Option<&str>) -> Option<String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+
+    if path.contains("{client_id}") {
+        let client_id = client_id.map(str::trim).filter(|value| !value.is_empty())?;
+        return Some(path.replace("{client_id}", client_id));
+    }
+
+    Some(path.to_string())
+}
+
+fn push_unique<I>(target: &mut Vec<String>, values: I)
+where
+    I: IntoIterator<Item = String>,
+{
+    for value in values {
+        if !target.iter().any(|existing| existing == &value) {
+            target.push(value);
+        }
     }
 }
 
@@ -686,8 +823,8 @@ mod tests {
             issuer: Some("https://issuer.example.com".to_string()),
             audience: Some("prompt-sentinel".to_string()),
             client_id: None,
-            scopes_claim: "scope".to_string(),
-            roles_claim: "roles".to_string(),
+            scopes_claims: vec!["scope".to_string()],
+            roles_claims: vec!["roles".to_string()],
             jwks_url: None,
             jwks_refresh_interval_secs: 300,
             clock_skew_secs: 60,
@@ -718,8 +855,8 @@ mod tests {
             issuer: None,
             audience: None,
             client_id: None,
-            scopes_claim: "scope".to_string(),
-            roles_claim: "roles".to_string(),
+            scopes_claims: vec!["scope".to_string()],
+            roles_claims: vec!["roles".to_string()],
             jwks_url: None,
             jwks_refresh_interval_secs: 300,
             clock_skew_secs: 60,
@@ -741,8 +878,8 @@ mod tests {
             issuer: None,
             audience: None,
             client_id: None,
-            scopes_claim: "scope".to_string(),
-            roles_claim: "roles".to_string(),
+            scopes_claims: vec!["scope".to_string()],
+            roles_claims: vec!["roles".to_string()],
             jwks_url: None,
             jwks_refresh_interval_secs: 300,
             clock_skew_secs: 60,
@@ -758,8 +895,8 @@ mod tests {
             issuer: None,
             audience: Some("prompt-sentinel".to_string()),
             client_id: Some("prompt-sentinel".to_string()),
-            scopes_claim: "scope".to_string(),
-            roles_claim: "roles".to_string(),
+            scopes_claims: vec!["scope".to_string()],
+            roles_claims: vec!["roles".to_string()],
             jwks_url: None,
             jwks_refresh_interval_secs: 300,
             clock_skew_secs: 60,
@@ -768,6 +905,140 @@ mod tests {
         assert_eq!(
             config.expected_audiences(),
             vec!["prompt-sentinel".to_string()]
+        );
+    }
+
+    #[test]
+    fn auth0_profile_maps_namespaced_roles_and_permissions() {
+        let profile = profile_for_provider(&OidcProvider::Auth0);
+        let verifier = InsecureJwtClaimVerifier::new(OidcVerifierConfig {
+            provider: OidcProvider::Auth0,
+            issuer: None,
+            audience: None,
+            client_id: Some("prompt-sentinel".to_string()),
+            scopes_claims: resolve_claim_candidates("auto", profile.scopes_claims),
+            roles_claims: resolve_claim_candidates("auto", profile.roles_claims),
+            jwks_url: None,
+            jwks_refresh_interval_secs: 300,
+            clock_skew_secs: 60,
+        });
+
+        let token = build_jwt(json!({
+            "sub": "auth0-user",
+            "aud": ["prompt-sentinel"],
+            "exp": Utc::now().timestamp() + 300,
+            "permissions": ["check:invoke", "audit:read"],
+            "https://tenant.example.com/roles": ["developer"]
+        }));
+
+        let principal = verifier.verify(&token).expect("token should verify");
+        assert_eq!(principal.roles, vec!["developer".to_string()]);
+        assert_eq!(
+            principal.scopes,
+            vec!["check:invoke".to_string(), "audit:read".to_string()]
+        );
+    }
+
+    #[test]
+    fn okta_profile_maps_groups_and_scp() {
+        let profile = profile_for_provider(&OidcProvider::Okta);
+        let verifier = InsecureJwtClaimVerifier::new(OidcVerifierConfig {
+            provider: OidcProvider::Okta,
+            issuer: None,
+            audience: None,
+            client_id: Some("prompt-sentinel".to_string()),
+            scopes_claims: resolve_claim_candidates("auto", profile.scopes_claims),
+            roles_claims: resolve_claim_candidates("auto", profile.roles_claims),
+            jwks_url: None,
+            jwks_refresh_interval_secs: 300,
+            clock_skew_secs: 60,
+        });
+
+        let token = build_jwt(json!({
+            "sub": "okta-user",
+            "aud": ["prompt-sentinel"],
+            "exp": Utc::now().timestamp() + 300,
+            "scp": ["check:invoke", "audit:read"],
+            "groups": ["compliance_admin"]
+        }));
+
+        let principal = verifier.verify(&token).expect("token should verify");
+        assert_eq!(principal.roles, vec!["compliance_admin".to_string()]);
+        assert_eq!(
+            principal.scopes,
+            vec!["check:invoke".to_string(), "audit:read".to_string()]
+        );
+    }
+
+    #[test]
+    fn azure_profile_maps_scp_and_roles() {
+        let profile = profile_for_provider(&OidcProvider::AzureAd);
+        let verifier = InsecureJwtClaimVerifier::new(OidcVerifierConfig {
+            provider: OidcProvider::AzureAd,
+            issuer: None,
+            audience: None,
+            client_id: Some("prompt-sentinel".to_string()),
+            scopes_claims: resolve_claim_candidates("auto", profile.scopes_claims),
+            roles_claims: resolve_claim_candidates("auto", profile.roles_claims),
+            jwks_url: None,
+            jwks_refresh_interval_secs: 300,
+            clock_skew_secs: 60,
+        });
+
+        let token = build_jwt(json!({
+            "sub": "azure-user",
+            "aud": ["prompt-sentinel"],
+            "exp": Utc::now().timestamp() + 300,
+            "scp": "check:invoke audit:read",
+            "roles": ["developer"]
+        }));
+
+        let principal = verifier.verify(&token).expect("token should verify");
+        assert_eq!(principal.roles, vec!["developer".to_string()]);
+        assert_eq!(
+            principal.scopes,
+            vec!["check:invoke".to_string(), "audit:read".to_string()]
+        );
+    }
+
+    #[test]
+    fn keycloak_profile_maps_realm_and_client_roles() {
+        let profile = profile_for_provider(&OidcProvider::Keycloak);
+        let verifier = InsecureJwtClaimVerifier::new(OidcVerifierConfig {
+            provider: OidcProvider::Keycloak,
+            issuer: None,
+            audience: None,
+            client_id: Some("prompt-sentinel".to_string()),
+            scopes_claims: resolve_claim_candidates("auto", profile.scopes_claims),
+            roles_claims: resolve_claim_candidates("auto", profile.roles_claims),
+            jwks_url: None,
+            jwks_refresh_interval_secs: 300,
+            clock_skew_secs: 60,
+        });
+
+        let token = build_jwt(json!({
+            "sub": "keycloak-user",
+            "aud": ["prompt-sentinel"],
+            "exp": Utc::now().timestamp() + 300,
+            "scope": "check:invoke audit:read",
+            "realm_access": {
+                "roles": ["realm_admin"]
+            },
+            "resource_access": {
+                "prompt-sentinel": {
+                    "roles": ["developer"]
+                }
+            }
+        }));
+
+        let principal = verifier.verify(&token).expect("token should verify");
+        assert_eq!(
+            principal.roles,
+            vec!["realm_admin".to_string(), "developer".to_string()]
+        );
+        assert_eq!(
+            principal.scopes,
+            vec!["check:invoke".to_string(), "audit:read".to_string()]
         );
     }
 

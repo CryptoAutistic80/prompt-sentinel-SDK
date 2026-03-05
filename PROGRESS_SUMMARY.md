@@ -7,7 +7,7 @@ Execution Mode: Phase-by-phase production hardening
 
 ## Current Stage Outcome
 
-This stage advanced **Phase 2 resource-level authorization scaffolding** by introducing project/environment-aware permission matching with backward-compatible global scope fallback.
+This stage advanced **Phase 2 provider-specific OIDC onboarding profiles** by adding tested claim-mapping defaults for Auth0, Okta, Azure AD, and Keycloak.
 
 ### Completed to date in this phase
 
@@ -68,6 +68,15 @@ This stage advanced **Phase 2 resource-level authorization scaffolding** by intr
   - both API key and OIDC bearer auth paths now include resource scope in `AuthContext`
   - added tests for matching scope allow, mismatched scope deny, and global fallback behavior
 - Updated README with resource-scoped scope formats and header usage.
+- Added provider-specific OIDC claim mapping profiles:
+  - `auth0`: maps scopes from `scope` / `permissions` (including namespaced `*/permissions`) and roles from `roles` / namespaced `*/roles`
+  - `okta`: maps scopes from `scp` / `scope` and roles from `groups` / `roles`
+  - `azure_ad`: maps scopes from `scp` / `scope` and roles from `roles` / `groups`
+  - `keycloak`: maps roles from `realm_access.roles` and `resource_access.{client_id}.roles`, plus `scope` / `scp`
+  - `generic`: keeps broad defaults (`scope`/`scp`, `roles`/`groups`)
+- Added support for claim selector lists and `auto` profiles (`OIDC_ROLES_CLAIM`, `OIDC_SCOPES_CLAIM`).
+- Added OIDC unit tests that verify provider-specific claim mappings for Auth0, Okta, Azure AD, and Keycloak.
+- Updated configuration/docs to default OIDC claim selectors to `auto` (`src/config/settings.rs`, `.env.example`, `README.md`).
 
 ## Phase Status Dashboard
 
@@ -75,7 +84,7 @@ This stage advanced **Phase 2 resource-level authorization scaffolding** by intr
 |---|---|---|
 | Phase 0 - Foundation Hardening | In Progress | Core security/reliability foundations implemented; OTel/Sentry/chaos/contract testing remain. |
 | Phase 1 - Provider-Agnostic LLM Support | In Progress | Provider abstraction + backend switching implemented; routing/fallback/cost optimization pending. |
-| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + durable auth access auditing + resource-level permission scaffold implemented; provider-specific onboarding/mTLS/multi-tenant isolation pending. |
+| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + durable auth access auditing + resource-level permission scaffold implemented; mTLS and full multi-tenant isolation pending. |
 | Phase 3 - Comprehensive EU AI Act Coverage | In Progress | Baseline classification exists; full article-by-article depth pending. |
 | Phase 4 - Audit Trail & Evidence Management | In Progress | Existing audit trail and proofs active; v2 schema + advanced exports/retention lifecycle pending. |
 | Phase 5 - Configuration & Rules Management | In Progress | Env-driven config active; hot reload/staged rollout/rollback/policy-as-code pending. |
@@ -132,11 +141,11 @@ This stage advanced **Phase 2 resource-level authorization scaffolding** by intr
   - Persistent file-backed auth key store.
   - OIDC provider abstraction + bearer-token auth integration.
   - JWT signature verification via JWKS with refreshable key cache.
+  - Provider-specific OIDC onboarding profiles with tested claim mappings (Auth0/Okta/Azure AD/Keycloak).
   - Auth access log retrieval.
   - Durable auth access-event persistence into tamper-evident audit storage.
   - Resource-level permission scaffold (project/environment-aware permission candidates + global fallback).
 - Remaining:
-  - Provider-specific setup flows (Auth0/Okta/Azure AD/Keycloak).
   - mTLS auth support.
   - Full multi-tenant isolation and quotas.
 
@@ -150,12 +159,15 @@ Commands run for this stage:
 
 ## Files Changed This Stage
 
-- `src/modules/auth/mod.rs`
+- `src/modules/auth/oidc.rs`
+- `src/config/settings.rs`
+- `src/server.rs`
+- `.env.example`
 - `README.md`
 - `PROGRESS_SUMMARY.md`
 
 ## Next Execution Slice
 
-1. Add provider-specific OIDC onboarding profiles (Auth0/Okta/Azure AD/Keycloak) with tested claim mappings.
-2. Add mTLS auth support for service-to-service deployments.
-3. Start multi-tenant isolation baseline (tenant/workspace identifiers + quota hooks).
+1. Add mTLS auth support for service-to-service deployments.
+2. Start multi-tenant isolation baseline (tenant/workspace identifiers + quota hooks).
+3. Add first-pass tenant quota enforcement hooks (request volume and concurrency).

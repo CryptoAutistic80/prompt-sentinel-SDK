@@ -154,9 +154,8 @@ impl AppSettings {
             oidc_issuer_url: parse_env_optional_string("OIDC_ISSUER_URL"),
             oidc_audience: parse_env_optional_string("OIDC_AUDIENCE"),
             oidc_client_id: parse_env_optional_string("OIDC_CLIENT_ID"),
-            oidc_roles_claim: env::var("OIDC_ROLES_CLAIM").unwrap_or_else(|_| "roles".to_string()),
-            oidc_scopes_claim: env::var("OIDC_SCOPES_CLAIM")
-                .unwrap_or_else(|_| "scope".to_string()),
+            oidc_roles_claim: env::var("OIDC_ROLES_CLAIM").unwrap_or_else(|_| "auto".to_string()),
+            oidc_scopes_claim: env::var("OIDC_SCOPES_CLAIM").unwrap_or_else(|_| "auto".to_string()),
             oidc_jwks_url: parse_env_optional_string("OIDC_JWKS_URL"),
             oidc_jwks_refresh_interval_secs: parse_env_u64("OIDC_JWKS_REFRESH_INTERVAL_SECS", 300)?,
             oidc_clock_skew_secs: parse_env_u64("OIDC_CLOCK_SKEW_SECS", 60)?,
