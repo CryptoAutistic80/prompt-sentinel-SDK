@@ -48,6 +48,7 @@ use crate::modules::semantic_detection::service::SemanticDetectionService;
 use crate::modules::telemetry::correlation::generate_correlation_id;
 use crate::modules::telemetry::metrics::{RequestTimer, get_metrics};
 use crate::modules::telemetry::tracing::{create_span_with_correlation, log_with_correlation};
+use crate::modules::tenant_policy::{DEFAULT_TENANT_POLICY_OVERLAYS_PATH, TenantPolicyResolver};
 use crate::workflow::{ComplianceEngine, ComplianceRequest, ComplianceResponse};
 
 #[derive(Clone)]
@@ -1159,6 +1160,8 @@ impl FrameworkConfig {
             tenant_quota_backend: "memory".to_string(),
             tenant_quota_sled_path: "prompt_sentinel_data/tenant_quota".to_string(),
             tenant_quota_concurrency_lease_secs: 120,
+            tenant_policy_overlays_path: "config/tenant_policy_overlays.json".to_string(),
+            tenant_policy_overlays_strict: false,
             oidc_enabled: false,
             oidc_provider: "generic".to_string(),
             oidc_issuer_url: None,
@@ -1185,6 +1188,40 @@ impl FrameworkConfig {
                 "AUTH_ENABLED=true but no credentials configured; protected routes will reject all requests"
             );
         }
+
+        let tenant_policy_overlay_path = if settings.tenant_policy_overlays_path.trim().is_empty() {
+            DEFAULT_TENANT_POLICY_OVERLAYS_PATH
+        } else {
+            settings.tenant_policy_overlays_path.as_str()
+        };
+
+        let tenant_policy_resolver = match TenantPolicyResolver::from_file(
+            tenant_policy_overlay_path,
+        ) {
+            Ok(resolver) => {
+                if resolver.is_empty() {
+                    info!("No tenant policy overlays loaded from `{tenant_policy_overlay_path}`");
+                } else {
+                    info!(
+                        "Loaded {} tenant policy overlays from `{tenant_policy_overlay_path}`",
+                        resolver.len()
+                    );
+                }
+                resolver
+            }
+            Err(error) => {
+                if settings.tenant_policy_overlays_strict {
+                    error!("Failed to load tenant policy overlays: {error}");
+                    return Err(Box::new(error));
+                }
+
+                warn!(
+                    "Failed to load tenant policy overlays from `{tenant_policy_overlay_path}`; \
+                         continuing without overlays: {error}"
+                );
+                TenantPolicyResolver::default()
+            }
+        };
 
         let audit_storage: Arc<dyn AuditStorage> =
             Arc::new(SledAuditStorage::new(&self.sled_db_path)?);
@@ -1268,7 +1305,8 @@ impl FrameworkConfig {
             bias_service,
             mistral_service,
             audit_logger,
-        );
+        )
+        .with_tenant_policy_resolver(tenant_policy_resolver);
 
         Ok(PromptSentinelServer::new(settings, engine))
     }

@@ -97,9 +97,21 @@ impl MistralService {
         &self,
         input: impl Into<String>,
     ) -> Result<ModerationResponse, MistralServiceError> {
+        self.moderate_text_with_model(input, None).await
+    }
+
+    pub async fn moderate_text_with_model(
+        &self,
+        input: impl Into<String>,
+        model_override: Option<&str>,
+    ) -> Result<ModerationResponse, MistralServiceError> {
         debug!("Moderating text with model: {:?}", self.moderation_model);
         let request = ModerationRequest {
-            model: self.moderation_model.clone(),
+            model: model_override
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .or_else(|| self.moderation_model.clone()),
             input: input.into(),
         };
         self.client.moderate(request).await.map_err(Into::into)
@@ -110,9 +122,24 @@ impl MistralService {
         prompt: impl Into<String>,
         safe_prompt: bool,
     ) -> Result<ChatCompletionResponse, MistralServiceError> {
+        self.generate_text_with_model(prompt, safe_prompt, None)
+            .await
+    }
+
+    pub async fn generate_text_with_model(
+        &self,
+        prompt: impl Into<String>,
+        safe_prompt: bool,
+        model_override: Option<&str>,
+    ) -> Result<ChatCompletionResponse, MistralServiceError> {
+        let model = model_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(self.generation_model.as_str())
+            .to_string();
         debug!("Generating text with model: {}", self.generation_model);
         let request = ChatCompletionRequest {
-            model: self.generation_model.clone(),
+            model,
             messages: vec![ChatMessage {
                 role: "user".to_owned(),
                 content: prompt.into(),

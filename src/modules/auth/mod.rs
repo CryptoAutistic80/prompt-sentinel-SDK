@@ -2548,6 +2548,8 @@ mod tests {
             tenant_quota_backend: "memory".to_string(),
             tenant_quota_sled_path: "prompt_sentinel_data/tenant_quota".to_string(),
             tenant_quota_concurrency_lease_secs: 120,
+            tenant_policy_overlays_path: "config/tenant_policy_overlays.json".to_string(),
+            tenant_policy_overlays_strict: false,
             oidc_enabled: false,
             oidc_provider: "generic".to_string(),
             oidc_issuer_url: None,

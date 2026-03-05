@@ -7,3 +7,4 @@ pub mod mistral_ai;
 pub mod prompt_firewall;
 pub mod semantic_detection;
 pub mod telemetry;
+pub mod tenant_policy;

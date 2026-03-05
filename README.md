@@ -114,6 +114,8 @@ docker run -d \
 | `TENANT_QUOTA_BACKEND` | Tenant quota store backend (`memory` or `sled`) | `memory` |
 | `TENANT_QUOTA_SLED_PATH` | Sled path used when `TENANT_QUOTA_BACKEND=sled` | `prompt_sentinel_data/tenant_quota` |
 | `TENANT_QUOTA_CONCURRENCY_LEASE_SECS` | Concurrency lease TTL (crash recovery) | `120` |
+| `TENANT_POLICY_OVERLAYS_PATH` | JSON file containing tenant/workspace policy overlays | `config/tenant_policy_overlays.json` |
+| `TENANT_POLICY_OVERLAYS_STRICT` | Fail startup if overlay file is unreadable/invalid | `false` |
 | `OIDC_ENABLED` | Enable OIDC bearer-token verification path | `false` |
 | `OIDC_PROVIDER` | `generic`, `auth0`, `okta`, `azure_ad`, `keycloak` | `generic` |
 | `OIDC_ISSUER_URL` | Expected JWT issuer (`iss`) | None |
@@ -135,6 +137,7 @@ Edit configuration files in the `config/` directory:
 
 - `firewall_rules.json`: Prompt firewall rules
 - `eu_risk_keywords.json`: EU AI Act compliance keywords
+- `tenant_policy_overlays.json`: Tenant/workspace policy overlays
 
 See [CONFIGURATION_GUIDE.md](CONFIGURATION_GUIDE.md) for detailed configuration options.
 
@@ -338,9 +341,18 @@ Quota hooks are middleware-enforced and disabled by default:
 - `TENANT_QUOTA_MAX_CONCURRENT_REQUESTS`: max in-flight requests per tenant
 - `TENANT_QUOTA_BACKEND`: `memory` (default) or `sled` for durable quota state
 - `TENANT_QUOTA_CONCURRENCY_LEASE_SECS`: lease TTL used to recover slots if an instance crashes before releasing
+- `TENANT_POLICY_OVERLAYS_PATH`: per-tenant/per-workspace overlay file for firewall, bias, EU keywords, and LLM preferences
+- `TENANT_POLICY_OVERLAYS_STRICT`: if `true`, invalid overlay config prevents startup
 
 OIDC tokens that provide a tenant claim are reconciled against tenant headers; mismatches are denied.
 Use `memory` for ephemeral single-instance limits, or `sled` for durable local limits (including restart recovery).
+
+Policy overlay behavior:
+
+- Firewall overlays can tighten `max_input_length` and add tenant-specific block patterns.
+- Bias overlays can override the detection threshold (`0.0..1.0`).
+- EU overlays append tenant-specific keyword packs to unacceptable/high/limited classifiers.
+- LLM overlays can pin generation/moderation model preferences and `safe_prompt`.
 
 ### POST /api/auth/keys/rotate
 

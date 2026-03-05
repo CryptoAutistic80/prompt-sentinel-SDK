@@ -9,7 +9,9 @@ use super::dtos::{
     ComplianceConfigurationResponse, ComplianceConfigurationSummary, ComplianceReportRequest,
     ComplianceReportResponse, DocumentationRequirements, RiskKeywordCounts,
 };
-use super::model::{AiRiskTier, ComplianceFinding, EuComplianceResult, ObligationResult, ObligationStatus};
+use super::model::{
+    AiRiskTier, ComplianceFinding, EuComplianceResult, ObligationResult, ObligationStatus,
+};
 
 const DEFAULT_EU_KEYWORDS_PATH: &str = "config/eu_risk_keywords.json";
 const EU_KEYWORDS_PATH_ENV: &str = "PROMPT_SENTINEL_EU_KEYWORDS_PATH";
@@ -47,6 +49,16 @@ const DEFAULT_LIMITED_KEYWORDS: &[&str] = &[
     "customer support bot",
     "deepfake",
 ];
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct EuKeywordOverrides {
+    #[serde(default)]
+    pub additional_unacceptable_keywords: Vec<String>,
+    #[serde(default)]
+    pub additional_high_keywords: Vec<String>,
+    #[serde(default)]
+    pub additional_limited_keywords: Vec<String>,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct EuRiskKeywordConfig {
@@ -111,7 +123,16 @@ pub struct EuLawComplianceService;
 impl EuLawComplianceService {
     /// Check compliance for a prompt/use-case and return structured result
     pub fn check_prompt(&self, prompt: &str) -> EuComplianceResult {
-        let risk_tier = classify_risk(prompt);
+        self.check_prompt_with_overrides(prompt, None)
+    }
+
+    /// Check compliance for a prompt/use-case using optional tenant/workspace keyword overlays.
+    pub fn check_prompt_with_overrides(
+        &self,
+        prompt: &str,
+        overrides: Option<&EuKeywordOverrides>,
+    ) -> EuComplianceResult {
+        let risk_tier = classify_risk_with_overrides(prompt, overrides);
         let mut obligations = Vec::new();
         let mut findings = Vec::new();
 
@@ -167,7 +188,9 @@ impl EuLawComplianceService {
             name: "Transparency Obligations".to_owned(),
             legal_basis: "Article 50, EU AI Act (Regulation 2024/1689)".to_owned(),
             status: transparency_status,
-            detail: Some("Users must be informed they are interacting with an AI system.".to_owned()),
+            detail: Some(
+                "Users must be informed they are interacting with an AI system.".to_owned(),
+            ),
             applicable_from: Some("2026-08-02".to_owned()),
         });
 
@@ -189,18 +212,23 @@ impl EuLawComplianceService {
                 name: "Human Oversight".to_owned(),
                 legal_basis: "Article 14, EU AI Act (Regulation 2024/1689)".to_owned(),
                 status: ObligationStatus::Partial,
-                detail: Some("High-risk AI must enable human oversight and intervention.".to_owned()),
+                detail: Some(
+                    "High-risk AI must enable human oversight and intervention.".to_owned(),
+                ),
                 applicable_from: Some("2026-08-02".to_owned()),
             });
 
             findings.push(ComplianceFinding {
                 code: "EU-HIGH-001".to_owned(),
-                detail: "High-risk use case detected. Additional compliance controls required.".to_owned(),
+                detail: "High-risk use case detected. Additional compliance controls required."
+                    .to_owned(),
             });
         }
 
         let compliant = !matches!(risk_tier, AiRiskTier::Unacceptable)
-            && !obligations.iter().any(|o| matches!(o.status, ObligationStatus::Gap));
+            && !obligations
+                .iter()
+                .any(|o| matches!(o.status, ObligationStatus::Gap));
 
         EuComplianceResult {
             risk_tier,
@@ -357,14 +385,34 @@ impl EuLawComplianceService {
 }
 
 fn classify_risk(intended_use: &str) -> AiRiskTier {
+    classify_risk_with_overrides(intended_use, None)
+}
+
+fn classify_risk_with_overrides(
+    intended_use: &str,
+    overrides: Option<&EuKeywordOverrides>,
+) -> AiRiskTier {
     let text = intended_use.to_ascii_lowercase();
     let keywords = CONFIG_MANAGER.get_config();
 
-    if contains_any(&text, &keywords.unacceptable) {
+    let unacceptable = merged_keywords(
+        &keywords.unacceptable,
+        overrides.map(|value| value.additional_unacceptable_keywords.as_slice()),
+    );
+    let high = merged_keywords(
+        &keywords.high,
+        overrides.map(|value| value.additional_high_keywords.as_slice()),
+    );
+    let limited = merged_keywords(
+        &keywords.limited,
+        overrides.map(|value| value.additional_limited_keywords.as_slice()),
+    );
+
+    if contains_any(&text, &unacceptable) {
         AiRiskTier::Unacceptable
-    } else if contains_any(&text, &keywords.high) {
+    } else if contains_any(&text, &high) {
         AiRiskTier::High
-    } else if contains_any(&text, &keywords.limited) {
+    } else if contains_any(&text, &limited) {
         AiRiskTier::Limited
     } else {
         AiRiskTier::Minimal
@@ -383,6 +431,26 @@ fn load_risk_keywords() -> EuRiskKeywordConfig {
 
 fn contains_any(text: &str, keywords: &[String]) -> bool {
     keywords.iter().any(|keyword| text.contains(keyword))
+}
+
+fn merged_keywords(base: &[String], additional: Option<&[String]>) -> Vec<String> {
+    let mut merged = base
+        .iter()
+        .map(|keyword| keyword.trim().to_ascii_lowercase())
+        .filter(|keyword| !keyword.is_empty())
+        .collect::<Vec<_>>();
+
+    if let Some(additional) = additional {
+        for keyword in additional {
+            let normalized = keyword.trim().to_ascii_lowercase();
+            if normalized.is_empty() || merged.iter().any(|item| item == &normalized) {
+                continue;
+            }
+            merged.push(normalized);
+        }
+    }
+
+    merged
 }
 
 fn save_risk_keywords(config: &EuRiskKeywordConfig) -> Result<(), std::io::Error> {
@@ -419,4 +487,37 @@ fn default_limited_keywords() -> Vec<String> {
         .iter()
         .map(|keyword| (*keyword).to_owned())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tenant_keyword_overrides_raise_risk_tier() {
+        let service = EuLawComplianceService;
+        let overrides = EuKeywordOverrides {
+            additional_unacceptable_keywords: vec!["predict criminality by dna".to_string()],
+            additional_high_keywords: vec![],
+            additional_limited_keywords: vec![],
+        };
+
+        let response = service.check_prompt_with_overrides(
+            "Build a tool to predict criminality by DNA profile.",
+            Some(&overrides),
+        );
+
+        assert_eq!(response.risk_tier, AiRiskTier::Unacceptable);
+    }
+
+    #[test]
+    fn tenant_keyword_overrides_default_to_base_when_empty() {
+        let service = EuLawComplianceService;
+        let response = service.check_prompt_with_overrides(
+            "Customer support chatbot for FAQ triage",
+            Some(&EuKeywordOverrides::default()),
+        );
+
+        assert_eq!(response.risk_tier, AiRiskTier::Limited);
+    }
 }

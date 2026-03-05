@@ -7,7 +7,7 @@ Execution Mode: Phase-by-phase production hardening
 
 ## Current Stage Outcome
 
-This stage advanced **Phase 2 tenant quota durability/distribution readiness** by adding a pluggable tenant quota storage backend with durable `sled` support and lease-based concurrency recovery semantics.
+This stage advanced **Phase 2 tenant policy overlay controls** by adding tenant/workspace configuration overlays for firewall behavior, bias thresholds, EU keyword packs, and LLM model preferences.
 
 ### Completed to date in this phase
 
@@ -118,6 +118,23 @@ This stage advanced **Phase 2 tenant quota durability/distribution readiness** b
   - lease expiry recovery when permits are not released
   - sled-backed rate-window persistence across manager restarts
 - Updated docs/examples (`README.md`, `.env.example`) with `TENANT_*` configuration and behavior notes.
+- Added tenant/workspace policy overlay subsystem:
+  - JSON policy file loader + resolver (`config/tenant_policy_overlays.json`)
+  - tenant-level base policy with optional workspace-level overrides
+  - normalization/deduplication for patterns and keyword packs
+- Added overlay-driven workflow enforcement:
+  - tenant firewall overrides (`max_input_length`, additional block patterns)
+  - tenant bias threshold overrides
+  - tenant EU risk keyword overlays (unacceptable/high/limited additive packs)
+  - tenant LLM preferences for generation/moderation model selection and `safe_prompt`
+- Added startup controls for overlay config:
+  - `TENANT_POLICY_OVERLAYS_PATH`
+  - `TENANT_POLICY_OVERLAYS_STRICT`
+  - strict mode fails startup on invalid overlay config; non-strict mode fails open to baseline behavior
+- Added unit coverage for:
+  - tenant policy resolver merge/normalization paths
+  - firewall tenant overrides
+  - EU keyword overlay risk-tier escalation paths
 
 ## Phase Status Dashboard
 
@@ -125,7 +142,7 @@ This stage advanced **Phase 2 tenant quota durability/distribution readiness** b
 |---|---|---|
 | Phase 0 - Foundation Hardening | In Progress | Core security/reliability foundations implemented; OTel/Sentry/chaos/contract testing remain. |
 | Phase 1 - Provider-Agnostic LLM Support | In Progress | Provider abstraction + backend switching implemented; routing/fallback/cost optimization pending. |
-| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + mTLS auth + durable auth access auditing + resource-level permission scaffold + tenant/workspace isolation baseline + first-pass tenant quota hooks + pluggable durable tenant quota backend (`memory`/`sled`) implemented; tenant-specific config overlays and data-residency controls pending. |
+| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + mTLS auth + durable auth access auditing + resource-level permission scaffold + tenant/workspace isolation baseline + first-pass tenant quota hooks + pluggable durable tenant quota backend (`memory`/`sled`) + tenant/workspace policy overlays implemented; data-residency controls pending. |
 | Phase 3 - Comprehensive EU AI Act Coverage | In Progress | Baseline classification exists; full article-by-article depth pending. |
 | Phase 4 - Audit Trail & Evidence Management | In Progress | Existing audit trail and proofs active; v2 schema + advanced exports/retention lifecycle pending. |
 | Phase 5 - Configuration & Rules Management | In Progress | Env-driven config active; hot reload/staged rollout/rollback/policy-as-code pending. |
@@ -193,18 +210,17 @@ This stage advanced **Phase 2 tenant quota durability/distribution readiness** b
   - Pluggable tenant quota backend (`memory`/`sled`) with durable sled state.
   - Lease-based tenant concurrency counters with stale-slot recovery window.
   - Tenant/workspace identifiers in workflow audit events and auth access audit events.
+  - Tenant/workspace configuration overlays (firewall limits/patterns, bias threshold, EU keyword packs, LLM generation/moderation preferences + safe prompt).
 - Remaining:
-  - Tenant-specific policy/config overlays (firewall, bias, EU keywords, provider prefs).
   - Data residency controls and tenant isolation penetration-test validation.
 
 ## Validation
 
 Commands run for this stage:
 
-- `cargo fmt` -> pass
+- `rustfmt --edition 2024 src/modules/tenant_policy/mod.rs src/modules/mod.rs src/modules/prompt_firewall/service.rs src/modules/eu_law_compliance/service.rs src/modules/mistral_ai/service.rs src/workflow/mod.rs src/server.rs src/config/settings.rs src/modules/auth/mod.rs tests/multilingual_response_test.rs` -> pass
 - `cargo check` -> pass
-- `cargo test tenant_ -- --nocapture` -> pass
-- `cargo test tenant_quota -- --nocapture` -> pass
+- `cargo test tenant_policy -- --nocapture` -> pass
 - `cargo test` -> pass (all suites green; benchmark test intentionally ignored)
 
 ## Files Changed This Stage
@@ -212,6 +228,13 @@ Commands run for this stage:
 - `src/modules/auth/mod.rs`
 - `src/config/settings.rs`
 - `src/server.rs`
+- `src/workflow/mod.rs`
+- `src/modules/prompt_firewall/service.rs`
+- `src/modules/eu_law_compliance/service.rs`
+- `src/modules/mistral_ai/service.rs`
+- `src/modules/mod.rs`
+- `src/modules/tenant_policy/mod.rs`
+- `config/tenant_policy_overlays.json`
 - `tests/multilingual_response_test.rs`
 - `.env.example`
 - `README.md`
@@ -219,6 +242,6 @@ Commands run for this stage:
 
 ## Next Execution Slice
 
-1. Add tenant-specific configuration overlays (firewall rules, bias thresholds, EU keyword packs, LLM provider preferences).
-2. Extend audit trail querying/filtering and storage policy controls for tenant/workspace + residency evidence.
-3. Add data residency controls and tenant-isolation penetration-test harnesses.
+1. Extend audit trail querying/filtering and storage policy controls for tenant/workspace + residency evidence.
+2. Add data residency controls and tenant-isolation penetration-test harnesses.
+3. Add tenant/workspace residency validation tests that prove cross-tenant and cross-region query denial behavior.

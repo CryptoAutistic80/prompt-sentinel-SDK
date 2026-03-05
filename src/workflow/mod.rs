@@ -7,13 +7,13 @@ use crate::modules::audit::proof::AuditProof;
 use crate::modules::bias_detection::dtos::{BiasScanRequest, BiasScanResult};
 use crate::modules::bias_detection::service::BiasDetectionService;
 use crate::modules::eu_law_compliance::model::{AiRiskTier, EuComplianceResult};
-use crate::modules::eu_law_compliance::service::EuLawComplianceService;
+use crate::modules::eu_law_compliance::service::{EuKeywordOverrides, EuLawComplianceService};
 use crate::modules::mistral_ai::dtos::ModerationResponse;
 use crate::modules::mistral_ai::service::{MistralService, MistralServiceError};
 use crate::modules::prompt_firewall::dtos::{
     FirewallAction, PromptFirewallRequest, PromptFirewallResult,
 };
-use crate::modules::prompt_firewall::service::PromptFirewallService;
+use crate::modules::prompt_firewall::service::{PromptFirewallOverrides, PromptFirewallService};
 use crate::modules::semantic_detection::dtos::{
     SemanticRiskLevel, SemanticScanRequest, SemanticScanResult,
 };
@@ -22,6 +22,7 @@ use crate::modules::semantic_detection::service::{
 };
 use crate::modules::telemetry::correlation::generate_correlation_id_from_request;
 use crate::modules::telemetry::tracing::{create_span_with_correlation, log_with_correlation};
+use crate::modules::tenant_policy::{ResolvedTenantPolicy, TenantPolicyResolver};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum WorkflowStatus {
@@ -90,6 +91,7 @@ pub struct ComplianceEngine {
     mistral_service: MistralService,
     audit_logger: AuditLogger,
     eu_compliance_service: EuLawComplianceService,
+    tenant_policy_resolver: TenantPolicyResolver,
 }
 
 impl ComplianceEngine {
@@ -107,7 +109,16 @@ impl ComplianceEngine {
             mistral_service,
             audit_logger,
             eu_compliance_service: EuLawComplianceService::default(),
+            tenant_policy_resolver: TenantPolicyResolver::default(),
         }
+    }
+
+    pub fn with_tenant_policy_resolver(
+        mut self,
+        tenant_policy_resolver: TenantPolicyResolver,
+    ) -> Self {
+        self.tenant_policy_resolver = tenant_policy_resolver;
+        self
     }
 
     /// Initialize the semantic detection service (call at startup)
@@ -173,6 +184,37 @@ impl ComplianceEngine {
             "Starting compliance workflow",
         );
 
+        let tenant_policy = self
+            .tenant_policy_resolver
+            .resolve(tenant_id.as_deref(), workspace_id.as_deref());
+        if tenant_policy.is_some() {
+            log_with_correlation(
+                &correlation_id,
+                tracing::Level::DEBUG,
+                "Applied tenant/workspace policy overlay",
+            );
+        }
+
+        let firewall_overrides = tenant_policy
+            .as_ref()
+            .and_then(prompt_firewall_overrides_from_policy);
+        let eu_keyword_overrides = tenant_policy
+            .as_ref()
+            .and_then(eu_keyword_overrides_from_policy);
+        let bias_threshold_override = tenant_policy
+            .as_ref()
+            .and_then(|policy| policy.bias.threshold);
+        let generation_model_override = tenant_policy
+            .as_ref()
+            .and_then(|policy| policy.llm_preferences.generation_model.as_deref());
+        let moderation_model_override = tenant_policy
+            .as_ref()
+            .and_then(|policy| policy.llm_preferences.moderation_model.as_deref());
+        let safe_prompt = tenant_policy
+            .as_ref()
+            .and_then(|policy| policy.llm_preferences.safe_prompt)
+            .unwrap_or(true);
+
         // Detect original language for response translation
         let original_language = self.detect_original_language(&original_prompt).await;
         log_with_correlation(
@@ -184,10 +226,13 @@ impl ComplianceEngine {
         // Step 1: Firewall check (fast, deterministic)
         let firewall = self
             .firewall_service
-            .inspect(PromptFirewallRequest {
-                prompt: original_prompt.clone(),
-                correlation_id: Some(correlation_id.clone()),
-            })
+            .inspect_with_overrides(
+                PromptFirewallRequest {
+                    prompt: original_prompt.clone(),
+                    correlation_id: Some(correlation_id.clone()),
+                },
+                firewall_overrides.as_ref(),
+            )
             .await;
 
         // Step 2: EU AI Act compliance check
@@ -196,14 +241,16 @@ impl ComplianceEngine {
             tracing::Level::INFO,
             "Performing EU AI Act compliance check",
         );
-        let eu_compliance = self.eu_compliance_service.check_prompt(&original_prompt);
+        let eu_compliance = self
+            .eu_compliance_service
+            .check_prompt_with_overrides(&original_prompt, eu_keyword_overrides.as_ref());
 
         // Step 3: Bias detection
         let bias = self
             .bias_service
             .scan(BiasScanRequest {
                 text: firewall.sanitized_prompt.clone(),
-                threshold: None,
+                threshold: bias_threshold_override,
             })
             .await;
 
@@ -371,8 +418,10 @@ impl ComplianceEngine {
             self.semantic_service.scan(SemanticScanRequest {
                 text: firewall.sanitized_prompt.clone(),
             }),
-            self.mistral_service
-                .moderate_text(firewall.sanitized_prompt.clone())
+            self.mistral_service.moderate_text_with_model(
+                firewall.sanitized_prompt.clone(),
+                moderation_model_override,
+            )
         );
         let semantic = semantic_result.ok();
         let input_moderation = input_moderation_result?;
@@ -547,7 +596,11 @@ impl ComplianceEngine {
         let generation_start = Instant::now();
         let generation = self
             .mistral_service
-            .generate_text(firewall.sanitized_prompt.clone(), true)
+            .generate_text_with_model(
+                firewall.sanitized_prompt.clone(),
+                safe_prompt,
+                generation_model_override,
+            )
             .await?;
         let generation_latency_ms = generation_start.elapsed().as_millis() as u64;
 
@@ -572,7 +625,7 @@ impl ComplianceEngine {
         );
         let output_moderation = self
             .mistral_service
-            .moderate_text(english_output.clone())
+            .moderate_text_with_model(english_output.clone(), moderation_model_override)
             .await?;
 
         if output_moderation.flagged {
@@ -755,6 +808,42 @@ impl ComplianceEngine {
             eu_compliance: Some(eu_compliance),
         })
     }
+}
+
+fn prompt_firewall_overrides_from_policy(
+    policy: &ResolvedTenantPolicy,
+) -> Option<PromptFirewallOverrides> {
+    if policy.firewall.max_input_length.is_none()
+        && policy.firewall.additional_block_patterns.is_empty()
+    {
+        return None;
+    }
+
+    Some(PromptFirewallOverrides {
+        max_input_length: policy.firewall.max_input_length,
+        additional_block_patterns: policy.firewall.additional_block_patterns.clone(),
+    })
+}
+
+fn eu_keyword_overrides_from_policy(policy: &ResolvedTenantPolicy) -> Option<EuKeywordOverrides> {
+    if policy
+        .eu_keywords
+        .additional_unacceptable_keywords
+        .is_empty()
+        && policy.eu_keywords.additional_high_keywords.is_empty()
+        && policy.eu_keywords.additional_limited_keywords.is_empty()
+    {
+        return None;
+    }
+
+    Some(EuKeywordOverrides {
+        additional_unacceptable_keywords: policy
+            .eu_keywords
+            .additional_unacceptable_keywords
+            .clone(),
+        additional_high_keywords: policy.eu_keywords.additional_high_keywords.clone(),
+        additional_limited_keywords: policy.eu_keywords.additional_limited_keywords.clone(),
+    })
 }
 
 #[derive(Debug, Error)]
