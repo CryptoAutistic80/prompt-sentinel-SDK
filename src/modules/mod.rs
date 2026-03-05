@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod auth;
 pub mod bias_detection;
 pub mod eu_law_compliance;
 pub mod llm;

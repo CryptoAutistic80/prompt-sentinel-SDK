@@ -35,6 +35,12 @@ impl LlmBackend {
 }
 
 #[derive(Clone, Debug)]
+pub struct AuthCredentialConfig {
+    pub token: String,
+    pub role: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct AppSettings {
     pub server_port: u16,
     pub llm_backend: LlmBackend,
@@ -50,6 +56,10 @@ pub struct AppSettings {
     pub llm_pool_idle_timeout_secs: u64,
     pub llm_circuit_breaker_failure_threshold: u32,
     pub llm_circuit_breaker_open_duration_secs: u64,
+    pub auth_enabled: bool,
+    pub auth_api_keys: Vec<AuthCredentialConfig>,
+    pub auth_service_tokens: Vec<AuthCredentialConfig>,
+    pub auth_rate_limit_per_minute: u32,
     pub bias_threshold: f32,
     pub max_input_length: usize,
     /// Threshold for semantic Low/Medium boundary (default: 0.70)
@@ -118,6 +128,10 @@ impl AppSettings {
                 "LLM_CIRCUIT_BREAKER_OPEN_DURATION_SECS",
                 30,
             )?,
+            auth_enabled: parse_env_bool("AUTH_ENABLED", false),
+            auth_api_keys: parse_auth_credentials("AUTH_API_KEYS"),
+            auth_service_tokens: parse_auth_credentials("AUTH_SERVICE_TOKENS"),
+            auth_rate_limit_per_minute: parse_env_u32("AUTH_RATE_LIMIT_PER_MINUTE", 300)?,
             bias_threshold,
             max_input_length,
             semantic_medium_threshold,
@@ -167,6 +181,48 @@ fn parse_csv_env(key: &str, defaults: &[&str]) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn parse_auth_credentials(key: &str) -> Vec<AuthCredentialConfig> {
+    let value = env::var(key).unwrap_or_default();
+    if value.trim().is_empty() {
+        return Vec::new();
+    }
+
+    value
+        .split(',')
+        .filter_map(parse_auth_credential_entry)
+        .collect()
+}
+
+fn parse_auth_credential_entry(entry: &str) -> Option<AuthCredentialConfig> {
+    let fields = entry
+        .split(':')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+
+    match fields.as_slice() {
+        [token, role] => Some(AuthCredentialConfig {
+            token: (*token).to_owned(),
+            role: (*role).to_owned(),
+        }),
+        [_label, token, role] => Some(AuthCredentialConfig {
+            token: (*token).to_owned(),
+            role: (*role).to_owned(),
+        }),
+        _ => None,
+    }
+}
+
+fn parse_env_bool(key: &str, default: bool) -> bool {
+    match env::var(key) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
 }
 
 fn parse_env_f32(key: &str, default: f32) -> Result<f32, SettingsError> {

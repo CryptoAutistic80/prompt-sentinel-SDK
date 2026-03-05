@@ -13,6 +13,7 @@ A comprehensive framework for safe, compliant, and ethical AI interactions with 
 - **Audit Logging**: Comprehensive audit trail for all operations
 - **Provider-Agnostic LLM Layer**: OpenAI-compatible and Anthropic-compatible backend support
 - **Production Hardening**: Health probes, circuit breaker, secure headers, and configurable CORS allowlist
+- **Auth + RBAC Bootstrap**: API key authentication, role permissions, and per-key rate limiting
 
 ## Quick Start
 
@@ -89,6 +90,10 @@ docker run -d \
 | `LLM_POOL_IDLE_TIMEOUT_SECS` | Upstream idle connection timeout | `90` |
 | `LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | Consecutive failures before open | `5` |
 | `LLM_CIRCUIT_BREAKER_OPEN_DURATION_SECS` | Circuit open window | `30` |
+| `AUTH_ENABLED` | Enable API key auth + RBAC middleware | `false` |
+| `AUTH_API_KEYS` | Comma-separated `token:role` or `label:token:role` values | None |
+| `AUTH_SERVICE_TOKENS` | Service account tokens with role mapping | None |
+| `AUTH_RATE_LIMIT_PER_MINUTE` | Per-key request limit per 60s | `300` |
 | `RUST_LOG` | Logging level | `info` |
 | `SERVER_PORT` | Server port | `3000` |
 | `SLED_DB_PATH` | Database path | `prompt_sentinel_data` |

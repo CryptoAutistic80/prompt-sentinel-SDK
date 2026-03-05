@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
     extract::State,
     http::{HeaderName, HeaderValue, Method, StatusCode},
+    response::IntoResponse,
     routing::{get, post},
 };
 use serde_json;
@@ -21,6 +22,7 @@ use crate::modules::audit::logger::AuditLogger;
 use crate::modules::audit::storage::{
     AuditStorage, AuditTrailRequest, AuditTrailResponse, SledAuditStorage,
 };
+use crate::modules::auth::{AuthError, AuthService};
 use crate::modules::bias_detection::service::BiasDetectionService;
 use crate::modules::eu_law_compliance::dtos::{
     ComplianceConfigurationRequest, ComplianceConfigurationResponse, ComplianceReportRequest,
@@ -44,6 +46,7 @@ use crate::workflow::{ComplianceEngine, ComplianceRequest, ComplianceResponse};
 pub struct AppState {
     pub engine: Arc<ComplianceEngine>,
     pub startup_complete: Arc<AtomicBool>,
+    pub auth_service: Arc<AuthService>,
 }
 
 /// Telemetry middleware for request tracking
@@ -124,6 +127,47 @@ async fn security_headers_middleware(
     response
 }
 
+/// Auth middleware for protected API endpoints.
+async fn auth_middleware(
+    State(state): State<AppState>,
+    mut request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+
+    match state
+        .auth_service
+        .authorize_request(request.headers(), &method, &path)
+    {
+        Ok(Some(auth_context)) => {
+            request.extensions_mut().insert(auth_context);
+            next.run(request).await
+        }
+        Ok(None) => next.run(request).await,
+        Err(error) => {
+            let (status, code) = match &error {
+                AuthError::MissingCredentials | AuthError::InvalidCredentials => {
+                    (StatusCode::UNAUTHORIZED, "unauthorized")
+                }
+                AuthError::Forbidden { .. } => (StatusCode::FORBIDDEN, "forbidden"),
+                AuthError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+            };
+
+            get_metrics().increment_errors("auth");
+
+            (
+                status,
+                Json(serde_json::json!({
+                    "error": code,
+                    "message": error.to_string(),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Framework server builder
 pub struct PromptSentinelServer {
     config: AppSettings,
@@ -133,11 +177,13 @@ pub struct PromptSentinelServer {
 impl PromptSentinelServer {
     /// Create a new server instance
     pub fn new(config: AppSettings, engine: ComplianceEngine) -> Self {
+        let auth_service = Arc::new(AuthService::from_settings(&config));
         Self {
             config,
             state: AppState {
                 engine: Arc::new(engine),
                 startup_complete: Arc::new(AtomicBool::new(true)),
+                auth_service,
             },
         }
     }
@@ -177,12 +223,8 @@ impl PromptSentinelServer {
 
     /// Build the axum router with all endpoints
     fn build_router(&self) -> Router {
-        Router::new()
+        let protected_routes = Router::new()
             .route("/api/compliance/check", post(check_compliance))
-            .route("/health", get(ready_check))
-            .route("/health/live", get(live_check))
-            .route("/health/ready", get(ready_check))
-            .route("/health/startup", get(startup_check))
             .route("/api/mistral/health", get(llm_health_check))
             .route("/api/llm/health", get(llm_health_check))
             .route("/v1/models", get(validate_models))
@@ -190,6 +232,17 @@ impl PromptSentinelServer {
             .route("/api/compliance/report", post(generate_compliance_report))
             .route("/api/compliance/config", get(get_compliance_config))
             .route("/api/compliance/config", post(update_compliance_config))
+            .route_layer(axum::middleware::from_fn_with_state(
+                self.state.clone(),
+                auth_middleware,
+            ));
+
+        Router::new()
+            .merge(protected_routes)
+            .route("/health", get(ready_check))
+            .route("/health/live", get(live_check))
+            .route("/health/ready", get(ready_check))
+            .route("/health/startup", get(startup_check))
             .layer(self.cors_layer())
             .route_layer(axum::middleware::from_fn(security_headers_middleware))
             .route_layer(axum::middleware::from_fn(telemetry_middleware))
@@ -475,12 +528,25 @@ impl FrameworkConfig {
             llm_pool_idle_timeout_secs: 90,
             llm_circuit_breaker_failure_threshold: 5,
             llm_circuit_breaker_open_duration_secs: 30,
+            auth_enabled: false,
+            auth_api_keys: Vec::new(),
+            auth_service_tokens: Vec::new(),
+            auth_rate_limit_per_minute: 300,
             bias_threshold: 0.35,
             max_input_length: 4096,
             semantic_medium_threshold: 0.70,
             semantic_high_threshold: 0.80,
             semantic_decision_margin: 0.02,
         });
+
+        if settings.auth_enabled
+            && settings.auth_api_keys.is_empty()
+            && settings.auth_service_tokens.is_empty()
+        {
+            warn!(
+                "AUTH_ENABLED=true but no credentials configured; protected routes will reject all requests"
+            );
+        }
 
         let audit_storage: Arc<dyn AuditStorage> =
             Arc::new(SledAuditStorage::new(&self.sled_db_path)?);
