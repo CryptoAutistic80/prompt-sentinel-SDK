@@ -1738,36 +1738,8 @@ mod tests {
 
     #[test]
     fn audit_query_scope_rejects_conflicting_region_filter() {
-        let policy_path = write_temp_audit_policy(
-            r#"{
-                "default": { "data_region": "global", "storage_policy": "standard", "retention_days": 365 },
-                "tenants": {
-                    "tenant-a": { "data_region": "eu-west-1", "storage_policy": "eu_restricted", "retention_days": 730 }
-                }
-            }"#,
-        );
-        let resolver = AuditStoragePolicyResolver::from_file(
-            policy_path
-                .to_str()
-                .expect("policy path should be valid UTF-8"),
-        )
-        .expect("policy resolver");
-        let guard = ResidencyGuard {
-            deployment_region: "eu-west-1".to_string(),
-            policy_resolver: resolver,
-        };
-
-        let auth_context = AuthContext {
-            principal_id: "principal".to_string(),
-            role: "developer".to_string(),
-            is_service_account: false,
-            scopes: vec!["audit:read".to_string()],
-            tenant_scope: TenantScope {
-                tenant_id: Some("tenant-a".to_string()),
-                workspace_id: None,
-            },
-            resource_scope: ResourceScope::default(),
-        };
+        let (policy_path, guard) = test_residency_guard("eu-west-1");
+        let auth_context = test_auth_context(Some("tenant-a"), None);
 
         let mut request = AuditTrailRequest {
             limit: Some(10),
@@ -1790,6 +1762,119 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(policy_path);
+    }
+
+    #[test]
+    fn pentest_cross_tenant_audit_query_is_denied() {
+        let auth_context = test_auth_context(Some("tenant-a"), None);
+        let mut request = AuditTrailRequest {
+            limit: Some(10),
+            offset: Some(0),
+            start_time: None,
+            end_time: None,
+            correlation_id: None,
+            tenant_id: Some("tenant-b".to_string()),
+            workspace_id: None,
+            data_region: None,
+            storage_policy: None,
+        };
+
+        let result = enforce_audit_query_scope(&mut request, &auth_context, None);
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("expected cross-tenant denial")
+                .contains("tenant scope")
+        );
+    }
+
+    #[test]
+    fn pentest_cross_workspace_audit_query_is_denied() {
+        let auth_context = test_auth_context(Some("tenant-a"), Some("workspace-prod"));
+        let mut request = AuditTrailRequest {
+            limit: Some(10),
+            offset: Some(0),
+            start_time: None,
+            end_time: None,
+            correlation_id: None,
+            tenant_id: Some("tenant-a".to_string()),
+            workspace_id: Some("workspace-dev".to_string()),
+            data_region: None,
+            storage_policy: None,
+        };
+
+        let result = enforce_audit_query_scope(&mut request, &auth_context, None);
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("expected cross-workspace denial")
+                .contains("workspace scope")
+        );
+    }
+
+    #[test]
+    fn pentest_cross_region_and_storage_policy_bypass_is_denied() {
+        let (policy_path, guard) = test_residency_guard("eu-west-1");
+        let auth_context = test_auth_context(Some("tenant-a"), None);
+
+        let mut request = AuditTrailRequest {
+            limit: Some(10),
+            offset: Some(0),
+            start_time: None,
+            end_time: None,
+            correlation_id: None,
+            tenant_id: Some("tenant-a".to_string()),
+            workspace_id: None,
+            data_region: Some("us-east-1".to_string()),
+            storage_policy: Some("standard".to_string()),
+        };
+
+        let result = enforce_audit_query_scope(&mut request, &auth_context, Some(&guard));
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("expected residency bypass denial")
+                .contains("data region")
+        );
+
+        let _ = std::fs::remove_file(policy_path);
+    }
+
+    fn test_auth_context(tenant_id: Option<&str>, workspace_id: Option<&str>) -> AuthContext {
+        AuthContext {
+            principal_id: "principal".to_string(),
+            role: "developer".to_string(),
+            is_service_account: false,
+            scopes: vec!["audit:read".to_string()],
+            tenant_scope: TenantScope {
+                tenant_id: tenant_id.map(ToOwned::to_owned),
+                workspace_id: workspace_id.map(ToOwned::to_owned),
+            },
+            resource_scope: ResourceScope::default(),
+        }
+    }
+
+    fn test_residency_guard(deployment_region: &str) -> (std::path::PathBuf, ResidencyGuard) {
+        let policy_path = write_temp_audit_policy(
+            r#"{
+                "default": { "data_region": "global", "storage_policy": "standard", "retention_days": 365 },
+                "tenants": {
+                    "tenant-a": { "data_region": "eu-west-1", "storage_policy": "eu_restricted", "retention_days": 730 }
+                }
+            }"#,
+        );
+        let resolver = AuditStoragePolicyResolver::from_file(
+            policy_path
+                .to_str()
+                .expect("policy path should be valid UTF-8"),
+        )
+        .expect("policy resolver");
+        let guard = ResidencyGuard {
+            deployment_region: deployment_region.to_string(),
+            policy_resolver: resolver,
+        };
+
+        (policy_path, guard)
     }
 
     fn write_temp_audit_policy(payload: &str) -> std::path::PathBuf {

@@ -7,7 +7,7 @@ Execution Mode: Phase-by-phase production hardening
 
 ## Current Stage Outcome
 
-This stage advanced **Phase 2 runtime fail-closed residency enforcement** by adding deployment-region guardrails that block non-compliant tenant traffic and by tightening audit query policy pinning for region/storage-policy filters.
+This stage advanced **Phase 2 penetration-test readiness** by adding an explicit tenant/workspace isolation pentest harness that validates denial of cross-tenant, cross-workspace, and cross-region/storage-policy traversal attempts.
 
 ### Completed to date in this phase
 
@@ -172,6 +172,11 @@ This stage advanced **Phase 2 runtime fail-closed residency enforcement** by add
   - deny path for mismatched deployment/tenant region
   - audit query filter pinning and conflict-denial paths
 - Updated docs/examples (`README.md`, `.env.example`) for runtime residency guard configuration.
+- Added adversarial tenant isolation pentest harness cases:
+  - cross-tenant audit query traversal is denied
+  - cross-workspace audit query traversal is denied
+  - cross-region + storage-policy bypass attempts are denied
+  - helper test fixtures now model authenticated tenant principals and region policy overlays
 
 ## Phase Status Dashboard
 
@@ -179,7 +184,7 @@ This stage advanced **Phase 2 runtime fail-closed residency enforcement** by add
 |---|---|---|
 | Phase 0 - Foundation Hardening | In Progress | Core security/reliability foundations implemented; OTel/Sentry/chaos/contract testing remain. |
 | Phase 1 - Provider-Agnostic LLM Support | In Progress | Provider abstraction + backend switching implemented; routing/fallback/cost optimization pending. |
-| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + mTLS auth + durable auth access auditing + resource-level permission scaffold + tenant/workspace isolation baseline + first-pass tenant quota hooks + pluggable durable tenant quota backend (`memory`/`sled`) + tenant/workspace policy overlays + audit query isolation filters + audit residency metadata + runtime fail-closed residency checks implemented; penetration-test harness pending. |
+| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + mTLS auth + durable auth access auditing + resource-level permission scaffold + tenant/workspace isolation baseline + first-pass tenant quota hooks + pluggable durable tenant quota backend (`memory`/`sled`) + tenant/workspace policy overlays + audit query isolation filters + audit residency metadata + runtime fail-closed residency checks + core isolation pentest harness implemented. |
 | Phase 3 - Comprehensive EU AI Act Coverage | In Progress | Baseline classification exists; full article-by-article depth pending. |
 | Phase 4 - Audit Trail & Evidence Management | In Progress | Existing audit trail and proofs active; v2 schema + advanced exports/retention lifecycle pending. |
 | Phase 5 - Configuration & Rules Management | In Progress | Env-driven config active; hot reload/staged rollout/rollback/policy-as-code pending. |
@@ -252,8 +257,9 @@ This stage advanced **Phase 2 runtime fail-closed residency enforcement** by add
   - Tenant/workspace scope enforcement on audit-trail queries.
   - Audit storage policy overlays with residency + retention metadata evidence on persisted records.
   - Runtime fail-closed residency guardrails for compliance processing and audit query filter pinning.
+  - Penetration-test harness cases for cross-tenant/cross-workspace/cross-region traversal attempts.
 - Remaining:
-  - Tenant/workspace penetration-test harness and adversarial isolation validation.
+  - Expand pentest harness to full API-level end-to-end flows (HTTP/middleware boundary), including spoofed-header and token replay scenarios.
 
 ## Validation
 
@@ -262,6 +268,7 @@ Commands run for this stage:
 - `rustfmt --edition 2024 src/server.rs src/config/settings.rs src/modules/auth/mod.rs tests/multilingual_response_test.rs` -> pass
 - `cargo check` -> pass
 - `cargo test residency_guard -- --nocapture` -> pass
+- `cargo test pentest_ -- --nocapture` -> pass
 - `cargo test` -> pass (all suites green; benchmark test intentionally ignored)
 
 ## Files Changed This Stage
@@ -276,6 +283,6 @@ Commands run for this stage:
 
 ## Next Execution Slice
 
-1. Build tenant/workspace penetration-test harnesses for cross-tenant and cross-region access attempts.
+1. Expand pentest harness to API-level end-to-end isolation tests through auth middleware and route handlers.
 2. Add adversarial isolation regression suites (token replay, header spoofing, mixed-scope audit traversal).
-3. Extend residency tests to include end-to-end API-level denial assertions under auth middleware.
+3. Add CI test grouping for isolation/security regressions so these checks are mandatory for production hardening gates.
