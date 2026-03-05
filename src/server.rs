@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::{
     Json, Router,
@@ -11,11 +11,13 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use serde::Deserialize;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json;
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use crate::config::settings::{
     AppSettings, DEFAULT_MISTRAL_BASE_URL, DEFAULT_MISTRAL_EMBEDDING_MODEL,
@@ -56,17 +58,14 @@ pub struct AppState {
     pub tenant_quota_manager: Option<Arc<TenantQuotaManager>>,
 }
 
-#[derive(Clone, Default)]
-struct TenantQuotaState {
-    request_times: VecDeque<Instant>,
-    active_requests: usize,
-}
+const QUOTA_WINDOW_MILLIS: i64 = 60_000;
 
 #[derive(Clone)]
 pub struct TenantQuotaManager {
     requests_per_minute: u32,
     max_concurrent_requests: usize,
-    inner: Arc<Mutex<HashMap<String, TenantQuotaState>>>,
+    concurrency_lease_millis: i64,
+    store: Arc<dyn TenantQuotaStore>,
 }
 
 impl TenantQuotaManager {
@@ -78,10 +77,17 @@ impl TenantQuotaManager {
             return None;
         }
 
+        let store = build_tenant_quota_store(settings);
+        let concurrency_lease_millis =
+            i64::try_from(settings.tenant_quota_concurrency_lease_secs.max(1))
+                .unwrap_or(120)
+                .saturating_mul(1_000);
+
         Some(Self {
             requests_per_minute,
             max_concurrent_requests,
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            concurrency_lease_millis,
+            store,
         })
     }
 
@@ -95,62 +101,47 @@ impl TenantQuotaManager {
             .ok_or(TenantQuotaError::MissingTenantId)?
             .to_string();
 
-        let mut guard = self.inner.lock().map_err(|_| TenantQuotaError::Internal)?;
-        let state = guard.entry(tenant_id.clone()).or_default();
-        let now = Instant::now();
-
-        while let Some(front) = state.request_times.front() {
-            if now.duration_since(*front) > Duration::from_secs(60) {
-                state.request_times.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        if self.requests_per_minute > 0
-            && state.request_times.len() as u32 >= self.requests_per_minute
-        {
-            return Err(TenantQuotaError::RequestsPerMinuteExceeded {
-                limit: self.requests_per_minute,
-            });
-        }
-
-        if self.max_concurrent_requests > 0 && state.active_requests >= self.max_concurrent_requests
-        {
-            return Err(TenantQuotaError::ConcurrentRequestsExceeded {
-                limit: self.max_concurrent_requests,
-            });
-        }
-
-        if self.requests_per_minute > 0 {
-            state.request_times.push_back(now);
-        }
-        state.active_requests = state.active_requests.saturating_add(1);
+        let lease_id = self.store.acquire(
+            &tenant_id,
+            self.requests_per_minute,
+            self.max_concurrent_requests,
+            self.concurrency_lease_millis,
+        )?;
 
         Ok(TenantQuotaPermit {
             manager: Arc::clone(self),
             tenant_id,
+            lease_id,
             released: false,
         })
     }
 
-    fn release(&self, tenant_id: &str) {
-        let Ok(mut guard) = self.inner.lock() else {
-            return;
-        };
-
-        if let Some(state) = guard.get_mut(tenant_id) {
-            state.active_requests = state.active_requests.saturating_sub(1);
-            if state.active_requests == 0 && state.request_times.is_empty() {
-                guard.remove(tenant_id);
-            }
+    fn release(&self, tenant_id: &str, lease_id: Option<&str>) {
+        if let Err(error) = self.store.release(tenant_id, lease_id) {
+            warn!("Failed to release tenant quota lease for `{tenant_id}`: {error:?}");
         }
+    }
+
+    #[cfg(test)]
+    fn for_tests(
+        requests_per_minute: u32,
+        max_concurrent_requests: usize,
+        concurrency_lease_millis: i64,
+        store: Arc<dyn TenantQuotaStore>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            requests_per_minute,
+            max_concurrent_requests,
+            concurrency_lease_millis,
+            store,
+        })
     }
 }
 
 struct TenantQuotaPermit {
     manager: Arc<TenantQuotaManager>,
     tenant_id: String,
+    lease_id: Option<String>,
     released: bool,
 }
 
@@ -159,9 +150,288 @@ impl Drop for TenantQuotaPermit {
         if self.released {
             return;
         }
-        self.manager.release(&self.tenant_id);
+        self.manager
+            .release(&self.tenant_id, self.lease_id.as_deref());
         self.released = true;
     }
+}
+
+trait TenantQuotaStore: Send + Sync {
+    fn acquire(
+        &self,
+        tenant_id: &str,
+        requests_per_minute: u32,
+        max_concurrent_requests: usize,
+        concurrency_lease_millis: i64,
+    ) -> Result<Option<String>, TenantQuotaError>;
+    fn release(&self, tenant_id: &str, lease_id: Option<&str>) -> Result<(), TenantQuotaError>;
+}
+
+#[derive(Default)]
+struct InMemoryTenantQuotaStore {
+    state: Mutex<HashMap<String, StoredTenantQuotaState>>,
+}
+
+impl TenantQuotaStore for InMemoryTenantQuotaStore {
+    fn acquire(
+        &self,
+        tenant_id: &str,
+        requests_per_minute: u32,
+        max_concurrent_requests: usize,
+        concurrency_lease_millis: i64,
+    ) -> Result<Option<String>, TenantQuotaError> {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| TenantQuotaError::BackendUnavailable {
+                detail: "tenant quota in-memory lock poisoned".to_string(),
+            })?;
+        let state = guard.entry(tenant_id.to_string()).or_default();
+        evaluate_and_apply_quota(
+            state,
+            now_ms,
+            requests_per_minute,
+            max_concurrent_requests,
+            concurrency_lease_millis,
+        )
+    }
+
+    fn release(&self, tenant_id: &str, lease_id: Option<&str>) -> Result<(), TenantQuotaError> {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| TenantQuotaError::BackendUnavailable {
+                detail: "tenant quota in-memory lock poisoned".to_string(),
+            })?;
+
+        let Some(state) = guard.get_mut(tenant_id) else {
+            return Ok(());
+        };
+
+        release_lease(state, now_ms, lease_id);
+        if state.request_times_ms.is_empty() && state.active_leases.is_empty() {
+            guard.remove(tenant_id);
+        }
+
+        Ok(())
+    }
+}
+
+struct SledTenantQuotaStore {
+    db: sled::Db,
+    lock: Mutex<()>,
+}
+
+impl SledTenantQuotaStore {
+    fn new(path: &str) -> Result<Self, TenantQuotaError> {
+        let db = sled::open(path).map_err(|error| TenantQuotaError::BackendUnavailable {
+            detail: format!("failed to open tenant quota sled store `{path}`: {error}"),
+        })?;
+        Ok(Self {
+            db,
+            lock: Mutex::new(()),
+        })
+    }
+
+    fn state_key(tenant_id: &str) -> String {
+        format!("tenant_quota::{tenant_id}")
+    }
+
+    fn load_state(&self, tenant_id: &str) -> Result<StoredTenantQuotaState, TenantQuotaError> {
+        let key = Self::state_key(tenant_id);
+        let Some(raw) = self
+            .db
+            .get(key)
+            .map_err(|error| TenantQuotaError::BackendUnavailable {
+                detail: format!("failed to read tenant quota state: {error}"),
+            })?
+        else {
+            return Ok(StoredTenantQuotaState::default());
+        };
+
+        serde_json::from_slice(&raw).map_err(|error| TenantQuotaError::BackendUnavailable {
+            detail: format!("failed to parse tenant quota state: {error}"),
+        })
+    }
+
+    fn write_state(
+        &self,
+        tenant_id: &str,
+        state: &StoredTenantQuotaState,
+    ) -> Result<(), TenantQuotaError> {
+        let key = Self::state_key(tenant_id);
+        if state.request_times_ms.is_empty() && state.active_leases.is_empty() {
+            self.db
+                .remove(key)
+                .map_err(|error| TenantQuotaError::BackendUnavailable {
+                    detail: format!("failed to delete tenant quota state: {error}"),
+                })?;
+        } else {
+            let payload = serde_json::to_vec(state).map_err(|error| {
+                TenantQuotaError::BackendUnavailable {
+                    detail: format!("failed to serialize tenant quota state: {error}"),
+                }
+            })?;
+            self.db
+                .insert(key, payload)
+                .map_err(|error| TenantQuotaError::BackendUnavailable {
+                    detail: format!("failed to write tenant quota state: {error}"),
+                })?;
+        }
+
+        self.db
+            .flush()
+            .map_err(|error| TenantQuotaError::BackendUnavailable {
+                detail: format!("failed to flush tenant quota state: {error}"),
+            })?;
+        Ok(())
+    }
+}
+
+impl TenantQuotaStore for SledTenantQuotaStore {
+    fn acquire(
+        &self,
+        tenant_id: &str,
+        requests_per_minute: u32,
+        max_concurrent_requests: usize,
+        concurrency_lease_millis: i64,
+    ) -> Result<Option<String>, TenantQuotaError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| TenantQuotaError::BackendUnavailable {
+                detail: "tenant quota sled lock poisoned".to_string(),
+            })?;
+
+        let now_ms = Utc::now().timestamp_millis();
+        let mut state = self.load_state(tenant_id)?;
+        let lease_id = evaluate_and_apply_quota(
+            &mut state,
+            now_ms,
+            requests_per_minute,
+            max_concurrent_requests,
+            concurrency_lease_millis,
+        )?;
+        self.write_state(tenant_id, &state)?;
+        Ok(lease_id)
+    }
+
+    fn release(&self, tenant_id: &str, lease_id: Option<&str>) -> Result<(), TenantQuotaError> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| TenantQuotaError::BackendUnavailable {
+                detail: "tenant quota sled lock poisoned".to_string(),
+            })?;
+
+        let now_ms = Utc::now().timestamp_millis();
+        let mut state = self.load_state(tenant_id)?;
+        release_lease(&mut state, now_ms, lease_id);
+        self.write_state(tenant_id, &state)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StoredTenantQuotaState {
+    request_times_ms: VecDeque<i64>,
+    active_leases: HashMap<String, i64>,
+}
+
+fn build_tenant_quota_store(settings: &AppSettings) -> Arc<dyn TenantQuotaStore> {
+    match settings
+        .tenant_quota_backend
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "memory" => Arc::new(InMemoryTenantQuotaStore::default()),
+        "sled" => {
+            let quota_path = settings.tenant_quota_sled_path.trim();
+            let quota_path = if quota_path.is_empty() {
+                "prompt_sentinel_data/tenant_quota"
+            } else {
+                quota_path
+            };
+
+            match SledTenantQuotaStore::new(quota_path) {
+                Ok(store) => Arc::new(store),
+                Err(error) => {
+                    warn!(
+                        "Failed to initialize sled tenant quota backend, falling back to memory: {error:?}"
+                    );
+                    Arc::new(InMemoryTenantQuotaStore::default())
+                }
+            }
+        }
+        other => {
+            warn!(
+                "Unknown TENANT_QUOTA_BACKEND `{other}`; expected `memory` or `sled`, falling back to memory"
+            );
+            Arc::new(InMemoryTenantQuotaStore::default())
+        }
+    }
+}
+
+fn evaluate_and_apply_quota(
+    state: &mut StoredTenantQuotaState,
+    now_ms: i64,
+    requests_per_minute: u32,
+    max_concurrent_requests: usize,
+    concurrency_lease_millis: i64,
+) -> Result<Option<String>, TenantQuotaError> {
+    prune_quota_state(state, now_ms);
+
+    if requests_per_minute > 0 && state.request_times_ms.len() as u32 >= requests_per_minute {
+        return Err(TenantQuotaError::RequestsPerMinuteExceeded {
+            limit: requests_per_minute,
+        });
+    }
+
+    if max_concurrent_requests > 0 && state.active_leases.len() >= max_concurrent_requests {
+        return Err(TenantQuotaError::ConcurrentRequestsExceeded {
+            limit: max_concurrent_requests,
+        });
+    }
+
+    if requests_per_minute > 0 {
+        state.request_times_ms.push_back(now_ms);
+    }
+
+    if max_concurrent_requests == 0 {
+        return Ok(None);
+    }
+
+    let lease_id = format!("quota_{}", Uuid::new_v4().simple());
+    state.active_leases.insert(
+        lease_id.clone(),
+        now_ms.saturating_add(concurrency_lease_millis.max(1)),
+    );
+    Ok(Some(lease_id))
+}
+
+fn release_lease(state: &mut StoredTenantQuotaState, now_ms: i64, lease_id: Option<&str>) {
+    prune_quota_state(state, now_ms);
+    if let Some(lease_id) = lease_id {
+        state.active_leases.remove(lease_id);
+    }
+}
+
+fn prune_quota_state(state: &mut StoredTenantQuotaState, now_ms: i64) {
+    let window_floor = now_ms.saturating_sub(QUOTA_WINDOW_MILLIS);
+    while let Some(ts) = state.request_times_ms.front() {
+        if *ts <= window_floor {
+            state.request_times_ms.pop_front();
+        } else {
+            break;
+        }
+    }
+
+    state
+        .active_leases
+        .retain(|_, lease_expiry| *lease_expiry > now_ms);
 }
 
 #[derive(Debug)]
@@ -169,7 +439,7 @@ enum TenantQuotaError {
     MissingTenantId,
     RequestsPerMinuteExceeded { limit: u32 },
     ConcurrentRequestsExceeded { limit: usize },
-    Internal,
+    BackendUnavailable { detail: String },
 }
 
 /// Telemetry middleware for request tracking
@@ -284,10 +554,10 @@ async fn auth_middleware(
                                 "tenant_concurrency_exceeded",
                                 format!("tenant concurrent request quota exceeded (limit={limit})"),
                             ),
-                            TenantQuotaError::Internal => (
+                            TenantQuotaError::BackendUnavailable { detail } => (
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 "tenant_quota_internal",
-                                "tenant quota enforcement is unavailable".to_string(),
+                                format!("tenant quota enforcement is unavailable: {detail}"),
                             ),
                         };
 
@@ -886,6 +1156,9 @@ impl FrameworkConfig {
             tenant_require_workspace: false,
             tenant_quota_requests_per_minute: 0,
             tenant_quota_max_concurrent_requests: 0,
+            tenant_quota_backend: "memory".to_string(),
+            tenant_quota_sled_path: "prompt_sentinel_data/tenant_quota".to_string(),
+            tenant_quota_concurrency_lease_secs: 120,
             oidc_enabled: false,
             oidc_provider: "generic".to_string(),
             oidc_issuer_url: None,
@@ -1004,14 +1277,16 @@ impl FrameworkConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread::sleep;
 
     #[test]
     fn tenant_quota_enforces_requests_per_minute() {
-        let manager = Arc::new(TenantQuotaManager {
-            requests_per_minute: 2,
-            max_concurrent_requests: 0,
-            inner: Arc::new(Mutex::new(HashMap::new())),
-        });
+        let manager = TenantQuotaManager::for_tests(
+            2,
+            0,
+            120_000,
+            Arc::new(InMemoryTenantQuotaStore::default()),
+        );
         let scope = TenantScope {
             tenant_id: Some("tenant-a".to_string()),
             workspace_id: None,
@@ -1028,11 +1303,12 @@ mod tests {
 
     #[test]
     fn tenant_quota_enforces_concurrency_limits() {
-        let manager = Arc::new(TenantQuotaManager {
-            requests_per_minute: 0,
-            max_concurrent_requests: 1,
-            inner: Arc::new(Mutex::new(HashMap::new())),
-        });
+        let manager = TenantQuotaManager::for_tests(
+            0,
+            1,
+            120_000,
+            Arc::new(InMemoryTenantQuotaStore::default()),
+        );
         let scope = TenantScope {
             tenant_id: Some("tenant-a".to_string()),
             workspace_id: None,
@@ -1050,11 +1326,12 @@ mod tests {
 
     #[test]
     fn tenant_quota_requires_tenant_scope() {
-        let manager = Arc::new(TenantQuotaManager {
-            requests_per_minute: 10,
-            max_concurrent_requests: 10,
-            inner: Arc::new(Mutex::new(HashMap::new())),
-        });
+        let manager = TenantQuotaManager::for_tests(
+            10,
+            10,
+            120_000,
+            Arc::new(InMemoryTenantQuotaStore::default()),
+        );
         let scope = TenantScope {
             tenant_id: None,
             workspace_id: None,
@@ -1064,5 +1341,58 @@ mod tests {
             manager.acquire(&scope),
             Err(TenantQuotaError::MissingTenantId)
         ));
+    }
+
+    #[test]
+    fn tenant_quota_recovers_after_lease_expiry_without_release() {
+        let manager =
+            TenantQuotaManager::for_tests(0, 1, 10, Arc::new(InMemoryTenantQuotaStore::default()));
+        let scope = TenantScope {
+            tenant_id: Some("tenant-expiry".to_string()),
+            workspace_id: None,
+        };
+
+        let leaked_permit = manager.acquire(&scope).expect("first request");
+        std::mem::forget(leaked_permit);
+        sleep(Duration::from_millis(20));
+
+        assert!(manager.acquire(&scope).is_ok());
+    }
+
+    #[test]
+    fn tenant_quota_sled_backend_persists_rate_window() {
+        let db_path = std::env::temp_dir().join(format!(
+            "prompt_sentinel_tenant_quota_{}",
+            Uuid::new_v4().simple()
+        ));
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let manager = TenantQuotaManager::for_tests(
+            1,
+            0,
+            120_000,
+            Arc::new(SledTenantQuotaStore::new(&db_path_str).expect("quota store")),
+        );
+        let scope = TenantScope {
+            tenant_id: Some("tenant-persist".to_string()),
+            workspace_id: None,
+        };
+        let permit = manager.acquire(&scope).expect("first request");
+        drop(permit);
+        drop(manager);
+
+        let manager_reloaded = TenantQuotaManager::for_tests(
+            1,
+            0,
+            120_000,
+            Arc::new(SledTenantQuotaStore::new(&db_path_str).expect("quota store reload")),
+        );
+
+        assert!(matches!(
+            manager_reloaded.acquire(&scope),
+            Err(TenantQuotaError::RequestsPerMinuteExceeded { limit: 1 })
+        ));
+
+        let _ = std::fs::remove_dir_all(db_path);
     }
 }

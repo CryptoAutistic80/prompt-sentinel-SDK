@@ -111,6 +111,9 @@ docker run -d \
 | `TENANT_REQUIRE_WORKSPACE` | Require workspace when tenant isolation is enabled | `false` |
 | `TENANT_QUOTA_REQUESTS_PER_MINUTE` | Per-tenant request ceiling (0 disables) | `0` |
 | `TENANT_QUOTA_MAX_CONCURRENT_REQUESTS` | Per-tenant active-request limit (0 disables) | `0` |
+| `TENANT_QUOTA_BACKEND` | Tenant quota store backend (`memory` or `sled`) | `memory` |
+| `TENANT_QUOTA_SLED_PATH` | Sled path used when `TENANT_QUOTA_BACKEND=sled` | `prompt_sentinel_data/tenant_quota` |
+| `TENANT_QUOTA_CONCURRENCY_LEASE_SECS` | Concurrency lease TTL (crash recovery) | `120` |
 | `OIDC_ENABLED` | Enable OIDC bearer-token verification path | `false` |
 | `OIDC_PROVIDER` | `generic`, `auth0`, `okta`, `azure_ad`, `keycloak` | `generic` |
 | `OIDC_ISSUER_URL` | Expected JWT issuer (`iss`) | None |
@@ -333,8 +336,11 @@ Quota hooks are middleware-enforced and disabled by default:
 
 - `TENANT_QUOTA_REQUESTS_PER_MINUTE`: rolling 60-second request cap per tenant
 - `TENANT_QUOTA_MAX_CONCURRENT_REQUESTS`: max in-flight requests per tenant
+- `TENANT_QUOTA_BACKEND`: `memory` (default) or `sled` for durable quota state
+- `TENANT_QUOTA_CONCURRENCY_LEASE_SECS`: lease TTL used to recover slots if an instance crashes before releasing
 
 OIDC tokens that provide a tenant claim are reconciled against tenant headers; mismatches are denied.
+Use `memory` for ephemeral single-instance limits, or `sled` for durable local limits (including restart recovery).
 
 ### POST /api/auth/keys/rotate
 

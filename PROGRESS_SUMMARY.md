@@ -7,7 +7,7 @@ Execution Mode: Phase-by-phase production hardening
 
 ## Current Stage Outcome
 
-This stage advanced the **Phase 2 multi-tenant isolation baseline** by adding tenant/workspace scope enforcement, first-pass tenant quota hooks, and tenant/workspace identifiers in compliance audit payloads.
+This stage advanced **Phase 2 tenant quota durability/distribution readiness** by adding a pluggable tenant quota storage backend with durable `sled` support and lease-based concurrency recovery semantics.
 
 ### Completed to date in this phase
 
@@ -98,6 +98,13 @@ This stage advanced the **Phase 2 multi-tenant isolation baseline** by adding te
   - per-tenant requests/minute (`TENANT_QUOTA_REQUESTS_PER_MINUTE`)
   - per-tenant concurrent in-flight requests (`TENANT_QUOTA_MAX_CONCURRENT_REQUESTS`)
   - explicit tenant quota error responses for protected routes
+- Added pluggable tenant quota backend support:
+  - `TENANT_QUOTA_BACKEND=memory|sled`
+  - `TENANT_QUOTA_SLED_PATH` for durable quota state
+  - automatic fallback to in-memory backend if sled init fails
+- Added lease-based concurrency tracking for tenant quotas:
+  - `TENANT_QUOTA_CONCURRENCY_LEASE_SECS` controls lease TTL
+  - stale in-flight slots self-recover after lease expiry (crash-safe behavior)
 - Extended compliance workflow request/audit schema:
   - `ComplianceRequest` now carries optional `tenant_id` + `workspace_id`
   - workflow audit events include `tenant_id` + `workspace_id`
@@ -107,6 +114,9 @@ This stage advanced the **Phase 2 multi-tenant isolation baseline** by adding te
   - auth tenant scope propagation path
   - OIDC tenant mismatch denial
   - tenant quota request + concurrency + missing-scope enforcement
+- Added tenant quota backend tests:
+  - lease expiry recovery when permits are not released
+  - sled-backed rate-window persistence across manager restarts
 - Updated docs/examples (`README.md`, `.env.example`) with `TENANT_*` configuration and behavior notes.
 
 ## Phase Status Dashboard
@@ -115,7 +125,7 @@ This stage advanced the **Phase 2 multi-tenant isolation baseline** by adding te
 |---|---|---|
 | Phase 0 - Foundation Hardening | In Progress | Core security/reliability foundations implemented; OTel/Sentry/chaos/contract testing remain. |
 | Phase 1 - Provider-Agnostic LLM Support | In Progress | Provider abstraction + backend switching implemented; routing/fallback/cost optimization pending. |
-| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + mTLS auth + durable auth access auditing + resource-level permission scaffold + tenant/workspace isolation baseline + first-pass tenant quota hooks implemented; tenant-specific config overlays and data-residency controls pending. |
+| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + mTLS auth + durable auth access auditing + resource-level permission scaffold + tenant/workspace isolation baseline + first-pass tenant quota hooks + pluggable durable tenant quota backend (`memory`/`sled`) implemented; tenant-specific config overlays and data-residency controls pending. |
 | Phase 3 - Comprehensive EU AI Act Coverage | In Progress | Baseline classification exists; full article-by-article depth pending. |
 | Phase 4 - Audit Trail & Evidence Management | In Progress | Existing audit trail and proofs active; v2 schema + advanced exports/retention lifecycle pending. |
 | Phase 5 - Configuration & Rules Management | In Progress | Env-driven config active; hot reload/staged rollout/rollback/policy-as-code pending. |
@@ -180,10 +190,11 @@ This stage advanced the **Phase 2 multi-tenant isolation baseline** by adding te
   - Tenant/workspace scope extraction + enforcement in auth context.
   - OIDC tenant-claim/header mismatch guardrails.
   - First-pass tenant quota hooks (per-tenant request/minute and concurrent in-flight limits).
+  - Pluggable tenant quota backend (`memory`/`sled`) with durable sled state.
+  - Lease-based tenant concurrency counters with stale-slot recovery window.
   - Tenant/workspace identifiers in workflow audit events and auth access audit events.
 - Remaining:
   - Tenant-specific policy/config overlays (firewall, bias, EU keywords, provider prefs).
-  - Persistent/distributed quota backend for multi-instance deployments.
   - Data residency controls and tenant isolation penetration-test validation.
 
 ## Validation
@@ -193,17 +204,14 @@ Commands run for this stage:
 - `cargo fmt` -> pass
 - `cargo check` -> pass
 - `cargo test tenant_ -- --nocapture` -> pass
+- `cargo test tenant_quota -- --nocapture` -> pass
 - `cargo test` -> pass (all suites green; benchmark test intentionally ignored)
 
 ## Files Changed This Stage
 
 - `src/modules/auth/mod.rs`
-- `src/modules/audit/logger.rs`
 - `src/config/settings.rs`
 - `src/server.rs`
-- `src/workflow/mod.rs`
-- `tests/compliance_flow.rs`
-- `tests/demo.rs`
 - `tests/multilingual_response_test.rs`
 - `.env.example`
 - `README.md`
@@ -211,6 +219,6 @@ Commands run for this stage:
 
 ## Next Execution Slice
 
-1. Add persistent/distributed tenant quota backend support for multi-instance deployments.
-2. Add tenant-specific configuration overlays (firewall rules, bias thresholds, EU keyword packs, LLM provider preferences).
-3. Extend audit trail querying/filtering and storage policy controls for tenant/workspace + residency evidence.
+1. Add tenant-specific configuration overlays (firewall rules, bias thresholds, EU keyword packs, LLM provider preferences).
+2. Extend audit trail querying/filtering and storage policy controls for tenant/workspace + residency evidence.
+3. Add data residency controls and tenant-isolation penetration-test harnesses.

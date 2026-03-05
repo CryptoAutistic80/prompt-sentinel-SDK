@@ -79,6 +79,9 @@ pub struct AppSettings {
     pub tenant_require_workspace: bool,
     pub tenant_quota_requests_per_minute: u32,
     pub tenant_quota_max_concurrent_requests: usize,
+    pub tenant_quota_backend: String,
+    pub tenant_quota_sled_path: String,
+    pub tenant_quota_concurrency_lease_secs: u64,
     pub oidc_enabled: bool,
     pub oidc_provider: String,
     pub oidc_issuer_url: Option<String>,
@@ -187,6 +190,14 @@ impl AppSettings {
             tenant_quota_max_concurrent_requests: parse_env_usize(
                 "TENANT_QUOTA_MAX_CONCURRENT_REQUESTS",
                 0,
+            )?,
+            tenant_quota_backend: env::var("TENANT_QUOTA_BACKEND")
+                .unwrap_or_else(|_| "memory".to_string()),
+            tenant_quota_sled_path: env::var("TENANT_QUOTA_SLED_PATH")
+                .unwrap_or_else(|_| "prompt_sentinel_data/tenant_quota".to_string()),
+            tenant_quota_concurrency_lease_secs: parse_env_u64(
+                "TENANT_QUOTA_CONCURRENCY_LEASE_SECS",
+                120,
             )?,
             oidc_enabled: parse_env_bool("OIDC_ENABLED", false),
             oidc_provider: env::var("OIDC_PROVIDER").unwrap_or_else(|_| "generic".to_string()),
