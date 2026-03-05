@@ -7,7 +7,7 @@ Execution Mode: Phase-by-phase production hardening
 
 ## Current Stage Outcome
 
-This stage advanced **Phase 2 tenant policy overlay controls** by adding tenant/workspace configuration overlays for firewall behavior, bias thresholds, EU keyword packs, and LLM model preferences.
+This stage advanced **Phase 2 audit isolation and residency evidence controls** by adding tenant/workspace-scoped audit query filtering, audit storage policy overlays, and residency/storage metadata persistence for every audit record.
 
 ### Completed to date in this phase
 
@@ -135,6 +135,31 @@ This stage advanced **Phase 2 tenant policy overlay controls** by adding tenant/
   - tenant policy resolver merge/normalization paths
   - firewall tenant overrides
   - EU keyword overlay risk-tier escalation paths
+- Extended audit storage schema with tenant/workspace + residency metadata:
+  - `tenant_id`
+  - `workspace_id`
+  - `data_region`
+  - `storage_policy`
+  - `retention_days`
+- Added audit storage policy resolver:
+  - policy file loader for `config/audit_storage_policies.json`
+  - default + tenant + workspace override resolution
+  - metadata fields for residency evidence and retention policy lineage
+- Added audit policy startup controls:
+  - `AUDIT_STORAGE_POLICY_PATH`
+  - `AUDIT_STORAGE_POLICY_STRICT`
+  - strict mode fails startup on invalid policy file
+- Extended `AuditTrailRequest` + backend filtering with:
+  - `tenant_id`
+  - `workspace_id`
+  - `data_region`
+  - `storage_policy`
+- Enforced tenant/workspace audit query scope in the API layer:
+  - authenticated tenant-scoped callers are pinned to their own tenant/workspace filters
+  - cross-tenant/workspace filter mismatches are denied
+- Added audit-focused unit tests:
+  - audit storage policy resolver behavior (default, tenant, workspace overrides)
+  - in-memory audit filtering by tenant/workspace/region/policy and time window
 
 ## Phase Status Dashboard
 
@@ -142,7 +167,7 @@ This stage advanced **Phase 2 tenant policy overlay controls** by adding tenant/
 |---|---|---|
 | Phase 0 - Foundation Hardening | In Progress | Core security/reliability foundations implemented; OTel/Sentry/chaos/contract testing remain. |
 | Phase 1 - Provider-Agnostic LLM Support | In Progress | Provider abstraction + backend switching implemented; routing/fallback/cost optimization pending. |
-| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + mTLS auth + durable auth access auditing + resource-level permission scaffold + tenant/workspace isolation baseline + first-pass tenant quota hooks + pluggable durable tenant quota backend (`memory`/`sled`) + tenant/workspace policy overlays implemented; data-residency controls pending. |
+| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + mTLS auth + durable auth access auditing + resource-level permission scaffold + tenant/workspace isolation baseline + first-pass tenant quota hooks + pluggable durable tenant quota backend (`memory`/`sled`) + tenant/workspace policy overlays + audit query isolation filters + audit residency metadata implemented; penetration-test harness and stricter residency enforcement paths pending. |
 | Phase 3 - Comprehensive EU AI Act Coverage | In Progress | Baseline classification exists; full article-by-article depth pending. |
 | Phase 4 - Audit Trail & Evidence Management | In Progress | Existing audit trail and proofs active; v2 schema + advanced exports/retention lifecycle pending. |
 | Phase 5 - Configuration & Rules Management | In Progress | Env-driven config active; hot reload/staged rollout/rollback/policy-as-code pending. |
@@ -211,37 +236,40 @@ This stage advanced **Phase 2 tenant policy overlay controls** by adding tenant/
   - Lease-based tenant concurrency counters with stale-slot recovery window.
   - Tenant/workspace identifiers in workflow audit events and auth access audit events.
   - Tenant/workspace configuration overlays (firewall limits/patterns, bias threshold, EU keyword packs, LLM generation/moderation preferences + safe prompt).
+  - Audit trail filter controls for tenant/workspace/region/storage policy.
+  - Tenant/workspace scope enforcement on audit-trail queries.
+  - Audit storage policy overlays with residency + retention metadata evidence on persisted records.
 - Remaining:
-  - Data residency controls and tenant isolation penetration-test validation.
+  - Runtime fail-closed residency guardrails for non-compliant region routing.
+  - Tenant/workspace penetration-test harness and adversarial isolation validation.
 
 ## Validation
 
 Commands run for this stage:
 
-- `rustfmt --edition 2024 src/modules/tenant_policy/mod.rs src/modules/mod.rs src/modules/prompt_firewall/service.rs src/modules/eu_law_compliance/service.rs src/modules/mistral_ai/service.rs src/workflow/mod.rs src/server.rs src/config/settings.rs src/modules/auth/mod.rs tests/multilingual_response_test.rs` -> pass
+- `rustfmt --edition 2024 src/modules/audit/policy.rs src/modules/audit/mod.rs src/modules/audit/logger.rs src/modules/audit/storage.rs src/server.rs src/config/settings.rs src/modules/auth/mod.rs tests/multilingual_response_test.rs tests/new_endpoints.rs` -> pass
 - `cargo check` -> pass
-- `cargo test tenant_policy -- --nocapture` -> pass
+- `cargo test audit_storage -- --nocapture` -> pass
 - `cargo test` -> pass (all suites green; benchmark test intentionally ignored)
 
 ## Files Changed This Stage
 
-- `src/modules/auth/mod.rs`
-- `src/config/settings.rs`
+- `src/modules/audit/policy.rs`
+- `src/modules/audit/mod.rs`
+- `src/modules/audit/logger.rs`
+- `src/modules/audit/storage.rs`
 - `src/server.rs`
-- `src/workflow/mod.rs`
-- `src/modules/prompt_firewall/service.rs`
-- `src/modules/eu_law_compliance/service.rs`
-- `src/modules/mistral_ai/service.rs`
-- `src/modules/mod.rs`
-- `src/modules/tenant_policy/mod.rs`
-- `config/tenant_policy_overlays.json`
+- `src/config/settings.rs`
+- `src/modules/auth/mod.rs`
 - `tests/multilingual_response_test.rs`
+- `tests/new_endpoints.rs`
+- `config/audit_storage_policies.json`
 - `.env.example`
 - `README.md`
 - `PROGRESS_SUMMARY.md`
 
 ## Next Execution Slice
 
-1. Extend audit trail querying/filtering and storage policy controls for tenant/workspace + residency evidence.
-2. Add data residency controls and tenant-isolation penetration-test harnesses.
-3. Add tenant/workspace residency validation tests that prove cross-tenant and cross-region query denial behavior.
+1. Add runtime fail-closed residency controls that block non-compliant region/storage-policy combinations during request processing.
+2. Build tenant/workspace penetration-test harnesses for cross-tenant and cross-region access attempts.
+3. Add isolation regression tests covering audit query denials for mismatched tenant/workspace/region filters.

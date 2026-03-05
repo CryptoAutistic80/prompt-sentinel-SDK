@@ -140,6 +140,10 @@ fn test_audit_trail_filters() {
         start_time: None,
         end_time: None,
         correlation_id: None,
+        tenant_id: None,
+        workspace_id: None,
+        data_region: None,
+        storage_policy: None,
     };
 
     // The actual implementation would be tested with a real storage backend

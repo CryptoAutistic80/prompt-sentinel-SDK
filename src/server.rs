@@ -24,6 +24,9 @@ use crate::config::settings::{
     DEFAULT_MISTRAL_GENERATION_MODEL, DEFAULT_MISTRAL_MODERATION_MODEL, LlmBackend,
 };
 use crate::modules::audit::logger::AuditLogger;
+use crate::modules::audit::policy::{
+    AuditStoragePolicyResolver, DEFAULT_AUDIT_STORAGE_POLICY_PATH,
+};
 use crate::modules::audit::storage::{
     AuditStorage, AuditTrailRequest, AuditTrailResponse, SledAuditStorage,
 };
@@ -1006,20 +1009,22 @@ fn map_auth_admin_error(error: AuthAdminError) -> (StatusCode, String) {
 
 async fn get_audit_trail(
     State(state): State<AppState>,
-    Json(request): Json<AuditTrailRequest>,
+    auth_context: Option<Extension<AuthContext>>,
+    Json(mut request): Json<AuditTrailRequest>,
 ) -> Result<Json<AuditTrailResponse>, (StatusCode, String)> {
     debug!("Received audit trail request");
+
+    if let Some(Extension(context)) = auth_context
+        && let Err(detail) = enforce_audit_query_scope(&mut request, &context)
+    {
+        get_metrics().increment_errors("audit_scope");
+        return Err((StatusCode::FORBIDDEN, detail));
+    }
 
     let audit_logger = state.engine.audit_logger();
     let storage = audit_logger.storage();
 
-    match storage.get_with_filters(
-        request.limit,
-        request.offset,
-        request.start_time,
-        request.end_time,
-        request.correlation_id,
-    ) {
+    match storage.get_with_filters(request) {
         Ok(response) => {
             info!("Audit trail retrieved successfully");
             Ok(Json(response))
@@ -1032,6 +1037,37 @@ async fn get_audit_trail(
             ))
         }
     }
+}
+
+fn enforce_audit_query_scope(
+    request: &mut AuditTrailRequest,
+    auth_context: &AuthContext,
+) -> Result<(), String> {
+    let context_tenant = auth_context.tenant_scope.tenant_id.as_deref();
+    let context_workspace = auth_context.tenant_scope.workspace_id.as_deref();
+
+    if let Some(context_tenant) = context_tenant {
+        if let Some(request_tenant) = request.tenant_id.as_deref()
+            && request_tenant != context_tenant
+        {
+            return Err("audit query tenant scope does not match authenticated tenant".to_string());
+        }
+        request.tenant_id = Some(context_tenant.to_string());
+
+        if let Some(context_workspace) = context_workspace {
+            if let Some(request_workspace) = request.workspace_id.as_deref()
+                && request_workspace != context_workspace
+            {
+                return Err(
+                    "audit query workspace scope does not match authenticated workspace"
+                        .to_string(),
+                );
+            }
+            request.workspace_id = Some(context_workspace.to_string());
+        }
+    }
+
+    Ok(())
 }
 
 async fn generate_compliance_report(
@@ -1162,6 +1198,8 @@ impl FrameworkConfig {
             tenant_quota_concurrency_lease_secs: 120,
             tenant_policy_overlays_path: "config/tenant_policy_overlays.json".to_string(),
             tenant_policy_overlays_strict: false,
+            audit_storage_policy_path: "config/audit_storage_policies.json".to_string(),
+            audit_storage_policy_strict: false,
             oidc_enabled: false,
             oidc_provider: "generic".to_string(),
             oidc_issuer_url: None,
@@ -1223,9 +1261,46 @@ impl FrameworkConfig {
             }
         };
 
+        let audit_storage_policy_path = if settings.audit_storage_policy_path.trim().is_empty() {
+            DEFAULT_AUDIT_STORAGE_POLICY_PATH
+        } else {
+            settings.audit_storage_policy_path.as_str()
+        };
+
+        let audit_storage_policy_resolver = match AuditStoragePolicyResolver::from_file(
+            audit_storage_policy_path,
+        ) {
+            Ok(resolver) => {
+                if resolver.is_empty() {
+                    info!(
+                        "No audit storage policy overlays loaded from `{audit_storage_policy_path}`"
+                    );
+                } else {
+                    info!(
+                        "Loaded {} tenant audit storage policies from `{audit_storage_policy_path}`",
+                        resolver.len()
+                    );
+                }
+                resolver
+            }
+            Err(error) => {
+                if settings.audit_storage_policy_strict {
+                    error!("Failed to load audit storage policy file: {error}");
+                    return Err(Box::new(error));
+                }
+
+                warn!(
+                    "Failed to load audit storage policy file from `{audit_storage_policy_path}`; \
+                         continuing without policy metadata: {error}"
+                );
+                AuditStoragePolicyResolver::default()
+            }
+        };
+
         let audit_storage: Arc<dyn AuditStorage> =
             Arc::new(SledAuditStorage::new(&self.sled_db_path)?);
-        let audit_logger = AuditLogger::new(audit_storage);
+        let audit_logger = AuditLogger::new(audit_storage)
+            .with_storage_policy_resolver(audit_storage_policy_resolver);
 
         let http_config = HttpClientConfig {
             request_timeout: Duration::from_secs(settings.llm_request_timeout_secs),

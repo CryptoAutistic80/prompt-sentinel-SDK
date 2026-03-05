@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::policy::{AuditStoragePolicy, AuditStoragePolicyResolver};
 use super::proof::{AuditProof, chain_hash, hash_record};
 use super::storage::{AuditStorage, AuditStorageError, StoredAuditRecord};
 
@@ -75,17 +76,37 @@ struct TypedAuditPayload<T> {
 #[derive(Clone)]
 pub struct AuditLogger {
     storage: Arc<dyn AuditStorage>,
+    storage_policy_resolver: Option<AuditStoragePolicyResolver>,
 }
 
 impl AuditLogger {
     pub fn new(storage: Arc<dyn AuditStorage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            storage_policy_resolver: None,
+        }
+    }
+
+    pub fn with_storage_policy_resolver(mut self, resolver: AuditStoragePolicyResolver) -> Self {
+        self.storage_policy_resolver = Some(resolver);
+        self
     }
 
     pub fn log_event(&self, event: AuditEvent) -> Result<AuditProof, AuditError> {
         let correlation_id = event.correlation_id.clone();
+        let tenant_id = event.tenant_id.clone();
+        let workspace_id = event.workspace_id.clone();
+        let storage_policy =
+            self.resolve_storage_policy(tenant_id.as_deref(), workspace_id.as_deref());
         let payload = serde_json::to_string(&event)?;
-        self.append_payload(correlation_id, Utc::now(), payload)
+        self.append_payload(
+            correlation_id,
+            Utc::now(),
+            payload,
+            tenant_id,
+            workspace_id,
+            storage_policy,
+        )
     }
 
     pub fn log_auth_access_event(
@@ -95,12 +116,34 @@ impl AuditLogger {
         let correlation_id = normalize_correlation_id(event.correlation_id.clone())
             .unwrap_or_else(|| format!("auth-{}", Uuid::new_v4().simple()));
         let timestamp = event.timestamp;
+        let tenant_id = event.tenant_id.clone();
+        let workspace_id = event.workspace_id.clone();
+        let storage_policy =
+            self.resolve_storage_policy(tenant_id.as_deref(), workspace_id.as_deref());
         let payload = serde_json::to_string(&TypedAuditPayload {
             event_type: "auth_access".to_string(),
             event,
         })?;
 
-        self.append_payload(correlation_id, timestamp, payload)
+        self.append_payload(
+            correlation_id,
+            timestamp,
+            payload,
+            tenant_id,
+            workspace_id,
+            storage_policy,
+        )
+    }
+
+    fn resolve_storage_policy(
+        &self,
+        tenant_id: Option<&str>,
+        workspace_id: Option<&str>,
+    ) -> AuditStoragePolicy {
+        self.storage_policy_resolver
+            .as_ref()
+            .map(|resolver| resolver.resolve(tenant_id, workspace_id))
+            .unwrap_or_default()
     }
 
     fn append_payload(
@@ -108,6 +151,9 @@ impl AuditLogger {
         correlation_id: String,
         timestamp: DateTime<Utc>,
         payload: String,
+        tenant_id: Option<String>,
+        workspace_id: Option<String>,
+        storage_policy: AuditStoragePolicy,
     ) -> Result<AuditProof, AuditError> {
         let record_hash = hash_record(&payload);
         let previous_chain = self.storage.latest_chain_hash()?;
@@ -124,6 +170,11 @@ impl AuditLogger {
             timestamp,
             payload,
             proof: proof.clone(),
+            tenant_id,
+            workspace_id,
+            data_region: storage_policy.data_region,
+            storage_policy: storage_policy.storage_policy,
+            retention_days: storage_policy.retention_days,
         };
         self.storage.append(record)?;
 

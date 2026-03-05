@@ -116,6 +116,8 @@ docker run -d \
 | `TENANT_QUOTA_CONCURRENCY_LEASE_SECS` | Concurrency lease TTL (crash recovery) | `120` |
 | `TENANT_POLICY_OVERLAYS_PATH` | JSON file containing tenant/workspace policy overlays | `config/tenant_policy_overlays.json` |
 | `TENANT_POLICY_OVERLAYS_STRICT` | Fail startup if overlay file is unreadable/invalid | `false` |
+| `AUDIT_STORAGE_POLICY_PATH` | JSON file containing audit residency/retention policy overlays | `config/audit_storage_policies.json` |
+| `AUDIT_STORAGE_POLICY_STRICT` | Fail startup if audit storage policy file is unreadable/invalid | `false` |
 | `OIDC_ENABLED` | Enable OIDC bearer-token verification path | `false` |
 | `OIDC_PROVIDER` | `generic`, `auth0`, `okta`, `azure_ad`, `keycloak` | `generic` |
 | `OIDC_ISSUER_URL` | Expected JWT issuer (`iss`) | None |
@@ -138,6 +140,7 @@ Edit configuration files in the `config/` directory:
 - `firewall_rules.json`: Prompt firewall rules
 - `eu_risk_keywords.json`: EU AI Act compliance keywords
 - `tenant_policy_overlays.json`: Tenant/workspace policy overlays
+- `audit_storage_policies.json`: Tenant/workspace audit residency + retention policy overlays
 
 See [CONFIGURATION_GUIDE.md](CONFIGURATION_GUIDE.md) for detailed configuration options.
 
@@ -353,6 +356,13 @@ Policy overlay behavior:
 - Bias overlays can override the detection threshold (`0.0..1.0`).
 - EU overlays append tenant-specific keyword packs to unacceptable/high/limited classifiers.
 - LLM overlays can pin generation/moderation model preferences and `safe_prompt`.
+
+Audit trail policy controls:
+
+- `AUDIT_STORAGE_POLICY_PATH` defines tenant/workspace storage policy overlays for `data_region`, `storage_policy`, and `retention_days`.
+- Every persisted audit record now includes tenant/workspace identifiers and resolved residency/storage metadata.
+- `POST /api/audit/trail` supports filters: `tenant_id`, `workspace_id`, `data_region`, `storage_policy` (in addition to correlation/time filters).
+- Authenticated tenant-scoped callers are forced to their own tenant/workspace filters on audit queries.
 
 ### POST /api/auth/keys/rotate
 

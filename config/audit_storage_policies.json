@@ -1,0 +1,8 @@
+{
+  "default": {
+    "data_region": "global",
+    "storage_policy": "standard",
+    "retention_days": 365
+  },
+  "tenants": {}
+}
