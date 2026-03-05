@@ -91,8 +91,8 @@ docker run -d \
 | `LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD` | Consecutive failures before open | `5` |
 | `LLM_CIRCUIT_BREAKER_OPEN_DURATION_SECS` | Circuit open window | `30` |
 | `AUTH_ENABLED` | Enable API key auth + RBAC middleware | `false` |
-| `AUTH_API_KEYS` | Comma-separated `token:role` or `label:token:role` values | None |
-| `AUTH_SERVICE_TOKENS` | Service account tokens with role mapping | None |
+| `AUTH_API_KEYS` | Comma-separated `token:role[:scope1\|scope2]` values | None |
+| `AUTH_SERVICE_TOKENS` | Comma-separated service tokens in same format | None |
 | `AUTH_RATE_LIMIT_PER_MINUTE` | Per-key request limit per 60s | `300` |
 | `RUST_LOG` | Logging level | `info` |
 | `SERVER_PORT` | Server port | `3000` |
@@ -228,6 +228,28 @@ Check LLM provider integration health.
   "models": ["model1", "model2", "model3"]
 }
 ```
+
+### GET /api/auth/keys
+
+List current auth credential metadata (token values are never returned).
+
+### POST /api/auth/keys/rotate
+
+Rotate a credential without restarting the server.
+
+**Request:**
+```json
+{
+  "old_token": "old-api-token",
+  "new_token": "new-api-token",
+  "role": "developer",
+  "scopes": ["check:invoke", "audit:read"]
+}
+```
+
+### GET /api/auth/access-log
+
+Fetch auth access events (allow/deny decisions).
 
 ## API Client Examples
 

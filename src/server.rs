@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderName, HeaderValue, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
 };
+use serde::Deserialize;
 use serde_json;
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -22,7 +23,7 @@ use crate::modules::audit::logger::AuditLogger;
 use crate::modules::audit::storage::{
     AuditStorage, AuditTrailRequest, AuditTrailResponse, SledAuditStorage,
 };
-use crate::modules::auth::{AuthError, AuthService};
+use crate::modules::auth::{AuthAdminError, AuthError, AuthService, RotateCredentialCommand};
 use crate::modules::bias_detection::service::BiasDetectionService;
 use crate::modules::eu_law_compliance::dtos::{
     ComplianceConfigurationRequest, ComplianceConfigurationResponse, ComplianceReportRequest,
@@ -152,6 +153,7 @@ async fn auth_middleware(
                 }
                 AuthError::Forbidden { .. } => (StatusCode::FORBIDDEN, "forbidden"),
                 AuthError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+                AuthError::InternalError => (StatusCode::INTERNAL_SERVER_ERROR, "auth_internal"),
             };
 
             get_metrics().increment_errors("auth");
@@ -228,6 +230,9 @@ impl PromptSentinelServer {
             .route("/api/mistral/health", get(llm_health_check))
             .route("/api/llm/health", get(llm_health_check))
             .route("/v1/models", get(validate_models))
+            .route("/api/auth/keys", get(list_auth_keys))
+            .route("/api/auth/keys/rotate", post(rotate_auth_key))
+            .route("/api/auth/access-log", get(get_auth_access_log))
             .route("/api/audit/trail", post(get_audit_trail))
             .route("/api/compliance/report", post(generate_compliance_report))
             .route("/api/compliance/config", get(get_compliance_config))
@@ -400,6 +405,82 @@ async fn validate_models(
 
     info!("Model validation completed");
     Ok(Json(response))
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthAccessLogQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RotateAuthKeyRequest {
+    old_token: String,
+    new_token: String,
+    role: Option<String>,
+    scopes: Option<Vec<String>>,
+    label: Option<String>,
+    is_service_account: Option<bool>,
+}
+
+async fn list_auth_keys(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let credentials = state
+        .auth_service
+        .list_credentials()
+        .map_err(map_auth_admin_error)?;
+
+    Ok(Json(serde_json::json!({
+        "count": credentials.len(),
+        "credentials": credentials,
+    })))
+}
+
+async fn rotate_auth_key(
+    State(state): State<AppState>,
+    Json(request): Json<RotateAuthKeyRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let updated = state
+        .auth_service
+        .rotate_credential(RotateCredentialCommand {
+            old_token: request.old_token,
+            new_token: request.new_token,
+            role: request.role,
+            scopes: request.scopes,
+            label: request.label,
+            is_service_account: request.is_service_account,
+        })
+        .map_err(map_auth_admin_error)?;
+
+    Ok(Json(serde_json::json!({
+        "status": "rotated",
+        "credential": updated,
+    })))
+}
+
+async fn get_auth_access_log(
+    State(state): State<AppState>,
+    Query(query): Query<AuthAccessLogQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let events = state
+        .auth_service
+        .access_events(query.limit)
+        .map_err(map_auth_admin_error)?;
+
+    Ok(Json(serde_json::json!({
+        "count": events.len(),
+        "events": events,
+    })))
+}
+
+fn map_auth_admin_error(error: AuthAdminError) -> (StatusCode, String) {
+    match error {
+        AuthAdminError::NotEnabled => (StatusCode::BAD_REQUEST, error.to_string()),
+        AuthAdminError::CredentialNotFound => (StatusCode::NOT_FOUND, error.to_string()),
+        AuthAdminError::NewTokenAlreadyExists => (StatusCode::CONFLICT, error.to_string()),
+        AuthAdminError::InvalidRequest(_) => (StatusCode::BAD_REQUEST, error.to_string()),
+        AuthAdminError::StoragePoisoned => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
 }
 
 async fn get_audit_trail(

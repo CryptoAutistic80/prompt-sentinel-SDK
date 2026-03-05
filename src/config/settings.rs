@@ -36,8 +36,10 @@ impl LlmBackend {
 
 #[derive(Clone, Debug)]
 pub struct AuthCredentialConfig {
+    pub label: Option<String>,
     pub token: String,
     pub role: String,
+    pub scopes: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -196,23 +198,34 @@ fn parse_auth_credentials(key: &str) -> Vec<AuthCredentialConfig> {
 }
 
 fn parse_auth_credential_entry(entry: &str) -> Option<AuthCredentialConfig> {
-    let fields = entry
-        .split(':')
-        .map(str::trim)
-        .filter(|field| !field.is_empty())
-        .collect::<Vec<_>>();
-
-    match fields.as_slice() {
-        [token, role] => Some(AuthCredentialConfig {
-            token: (*token).to_owned(),
-            role: (*role).to_owned(),
-        }),
-        [_label, token, role] => Some(AuthCredentialConfig {
-            token: (*token).to_owned(),
-            role: (*role).to_owned(),
-        }),
-        _ => None,
+    let fields = entry.splitn(3, ':').collect::<Vec<_>>();
+    if fields.len() < 2 {
+        return None;
     }
+
+    let token = fields[0].trim();
+    let role = fields[1].trim();
+    if token.is_empty() || role.is_empty() {
+        return None;
+    }
+
+    let scopes = if fields.len() == 3 {
+        fields[2]
+            .split('|')
+            .map(str::trim)
+            .filter(|scope| !scope.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    Some(AuthCredentialConfig {
+        label: None,
+        token: token.to_owned(),
+        role: role.to_owned(),
+        scopes,
+    })
 }
 
 fn parse_env_bool(key: &str, default: bool) -> bool {

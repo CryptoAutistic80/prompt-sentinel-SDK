@@ -13,8 +13,11 @@ This stage advanced **Phase 2 bootstrap** while preserving the earlier Phase 0/1
 
 - Added API key authentication middleware for protected API routes.
 - Added RBAC permission checks by route + method.
+- Added per-key scope support (scope override beyond role defaults).
 - Added support for service account tokens.
 - Added per-key rate limiting (requests/minute window).
+- Added runtime credential rotation support (no restart) via auth admin endpoint.
+- Added auth access audit log (allow/deny decisions, principal, path, method).
 - Added auth configuration via env:
   - `AUTH_ENABLED`
   - `AUTH_API_KEYS`
@@ -22,7 +25,11 @@ This stage advanced **Phase 2 bootstrap** while preserving the earlier Phase 0/1
   - `AUTH_RATE_LIMIT_PER_MINUTE`
 - Added new auth module with unit tests.
 - Updated server wiring to enforce auth only on protected endpoints while keeping health probes open.
-- Updated docs/examples (`README.md`, `.env.example`).
+- Added protected auth admin APIs:
+  - `GET /api/auth/keys`
+  - `POST /api/auth/keys/rotate`
+  - `GET /api/auth/access-log`
+- Updated docs/examples (`README.md`, `.env.example`) for scoped token format.
 
 ## Phase Status Dashboard
 
@@ -80,7 +87,10 @@ This stage advanced **Phase 2 bootstrap** while preserving the earlier Phase 0/1
   - API key authentication.
   - Service account token support.
   - RBAC route permission checks.
+  - Per-key scopes.
   - Per-key rate limiting.
+  - Runtime credential rotation.
+  - Auth access log retrieval.
 - Remaining:
   - Key generation/expiry/rotation workflows.
   - OAuth 2.0 / OIDC integrations.
@@ -110,6 +120,6 @@ Commands run for this stage:
 
 ## Next Execution Slice
 
-1. Expand Phase 2 with key rotation + scoped key metadata + access audit trail entries.
+1. Add key lifecycle management APIs (generate, expire, revoke) with persistent storage backend.
 2. Start OAuth/OIDC provider abstraction (Auth0/Okta/Azure AD/Keycloak-ready).
-3. Resume Phase 0 observability backlog (OpenTelemetry + exporter wiring).
+3. Persist auth access audit events into the main audit evidence layer.
