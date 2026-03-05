@@ -1,0 +1,24 @@
+name: Isolation Regressions
+
+on:
+  push:
+    branches:
+      - main
+      - feat/**
+  pull_request:
+
+jobs:
+  isolation-regressions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run server isolation pentest suite
+        run: cargo test pentest_ -- --nocapture
+
+      - name: Run security regression suite
+        run: cargo test --test security_regressions -- --nocapture

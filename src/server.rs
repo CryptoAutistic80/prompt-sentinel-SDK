@@ -1504,8 +1504,20 @@ impl FrameworkConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::settings::{AuthCredentialConfig, LlmBackend};
+    use crate::modules::audit::logger::AuditLogger;
+    use crate::modules::audit::storage::{AuditStorage, InMemoryAuditStorage};
     use crate::modules::auth::ResourceScope;
+    use crate::modules::bias_detection::service::BiasDetectionService;
+    use crate::modules::mistral_ai::client::{MistralClient, MockMistralClient};
+    use crate::modules::mistral_ai::service::MistralService;
+    use crate::modules::prompt_firewall::service::PromptFirewallService;
+    use crate::modules::semantic_detection::service::SemanticDetectionService;
+    use crate::workflow::ComplianceEngine;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
     use std::thread::sleep;
+    use tower::ServiceExt;
 
     #[test]
     fn tenant_quota_enforces_requests_per_minute() {
@@ -1840,6 +1852,159 @@ mod tests {
         let _ = std::fs::remove_file(policy_path);
     }
 
+    #[tokio::test]
+    async fn pentest_api_cross_tenant_audit_query_is_denied() {
+        let app = build_test_router(pentest_settings("tenant-a-token", vec!["audit:read"]), None);
+        let response = send_post(
+            &app,
+            "/api/audit/trail",
+            &[("x-api-key", "tenant-a-token"), ("x-tenant-id", "tenant-a")],
+            serde_json::json!({
+                "limit": 10,
+                "offset": 0,
+                "tenant_id": "tenant-b"
+            }),
+        )
+        .await;
+
+        let status = response.status();
+        let body = response_body_text(response).await.to_ascii_lowercase();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("tenant scope"));
+    }
+
+    #[tokio::test]
+    async fn pentest_api_cross_workspace_audit_query_is_denied() {
+        let app = build_test_router(pentest_settings("tenant-a-token", vec!["audit:read"]), None);
+        let response = send_post(
+            &app,
+            "/api/audit/trail",
+            &[
+                ("x-api-key", "tenant-a-token"),
+                ("x-tenant-id", "tenant-a"),
+                ("x-workspace-id", "workspace-prod"),
+            ],
+            serde_json::json!({
+                "limit": 10,
+                "offset": 0,
+                "tenant_id": "tenant-a",
+                "workspace_id": "workspace-dev"
+            }),
+        )
+        .await;
+
+        let status = response.status();
+        let body = response_body_text(response).await.to_ascii_lowercase();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("workspace scope"));
+    }
+
+    #[tokio::test]
+    async fn pentest_api_cross_region_and_storage_policy_bypass_is_denied() {
+        let (policy_path, guard) = test_residency_guard("eu-west-1");
+        let app = build_test_router(
+            pentest_settings("tenant-a-token", vec!["audit:read"]),
+            Some(guard),
+        );
+        let response = send_post(
+            &app,
+            "/api/audit/trail",
+            &[("x-api-key", "tenant-a-token"), ("x-tenant-id", "tenant-a")],
+            serde_json::json!({
+                "limit": 10,
+                "offset": 0,
+                "tenant_id": "tenant-a",
+                "data_region": "us-east-1",
+                "storage_policy": "standard"
+            }),
+        )
+        .await;
+
+        let status = response.status();
+        let body = response_body_text(response).await.to_ascii_lowercase();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("data region"));
+
+        let _ = std::fs::remove_file(policy_path);
+    }
+
+    #[tokio::test]
+    async fn pentest_api_spoofed_default_tenant_header_is_ignored() {
+        let mut settings = pentest_settings("tenant-a-token", vec!["audit:read"]);
+        settings.tenant_id_header = "x-internal-tenant".to_string();
+        let app = build_test_router(settings, None);
+
+        let response = send_post(
+            &app,
+            "/api/audit/trail",
+            &[
+                ("x-api-key", "tenant-a-token"),
+                ("x-tenant-id", "tenant-b"), // spoofed header not used by deployment config
+            ],
+            serde_json::json!({
+                "limit": 10,
+                "offset": 0,
+                "tenant_id": "tenant-b"
+            }),
+        )
+        .await;
+
+        let status = response.status();
+        let body = response_body_text(response).await.to_ascii_lowercase();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("tenant scope"));
+    }
+
+    #[tokio::test]
+    async fn pentest_api_token_replay_after_rotation_is_denied() {
+        let mut settings = pentest_settings("rotate-me", vec!["auth:write", "audit:read"]);
+        settings.tenant_isolation_enabled = false;
+        let app = build_test_router(settings, None);
+
+        let rotate_response = send_post(
+            &app,
+            "/api/auth/keys/rotate",
+            &[("x-api-key", "rotate-me")],
+            serde_json::json!({
+                "old_token": "rotate-me",
+                "new_token": "rotate-me-v2",
+                "role": "developer",
+                "scopes": ["auth:write", "audit:read"]
+            }),
+        )
+        .await;
+        assert_eq!(rotate_response.status(), StatusCode::OK);
+
+        let replay_response = send_post(
+            &app,
+            "/api/audit/trail",
+            &[("x-api-key", "rotate-me")],
+            serde_json::json!({
+                "limit": 10,
+                "offset": 0
+            }),
+        )
+        .await;
+        let replay_status = replay_response.status();
+        let replay_body = response_body_text(replay_response)
+            .await
+            .to_ascii_lowercase();
+        assert_eq!(replay_status, StatusCode::UNAUTHORIZED);
+        assert!(replay_body.contains("invalid api credentials"));
+
+        let fresh_response = send_post(
+            &app,
+            "/api/audit/trail",
+            &[("x-api-key", "rotate-me-v2")],
+            serde_json::json!({
+                "limit": 10,
+                "offset": 0
+            }),
+        )
+        .await;
+        assert_eq!(fresh_response.status(), StatusCode::OK);
+    }
+
     fn test_auth_context(tenant_id: Option<&str>, workspace_id: Option<&str>) -> AuthContext {
         AuthContext {
             principal_id: "principal".to_string(),
@@ -1875,6 +2040,145 @@ mod tests {
         };
 
         (policy_path, guard)
+    }
+
+    fn pentest_settings(api_token: &str, scopes: Vec<&str>) -> AppSettings {
+        AppSettings {
+            server_port: 3000,
+            llm_backend: LlmBackend::OpenAICompat,
+            llm_api_key: Some("mock".to_string()),
+            llm_base_url: "http://localhost".to_string(),
+            generation_model: "mock-model".to_string(),
+            moderation_model: Some("mock-moderation".to_string()),
+            embedding_model: "mock-embedding".to_string(),
+            cors_allowed_origins: vec!["http://localhost:5175".to_string()],
+            llm_request_timeout_secs: 120,
+            llm_connect_timeout_secs: 10,
+            llm_pool_max_idle_per_host: 20,
+            llm_pool_idle_timeout_secs: 90,
+            llm_circuit_breaker_failure_threshold: 5,
+            llm_circuit_breaker_open_duration_secs: 30,
+            auth_enabled: true,
+            auth_api_keys: vec![AuthCredentialConfig {
+                label: Some("pentest".to_string()),
+                token: api_token.to_string(),
+                role: "developer".to_string(),
+                scopes: scopes.into_iter().map(ToOwned::to_owned).collect(),
+            }],
+            auth_service_tokens: Vec::new(),
+            auth_rate_limit_per_minute: 1_000,
+            auth_key_store_path: None,
+            auth_default_key_expiry_secs: None,
+            mtls_enabled: false,
+            mtls_verified_header: "x-client-cert-verified".to_string(),
+            mtls_verified_value: "SUCCESS".to_string(),
+            mtls_subject_header: "x-client-cert-subject".to_string(),
+            mtls_fingerprint_header: "x-client-cert-fingerprint".to_string(),
+            mtls_allowed_subjects: vec![],
+            mtls_allowed_fingerprints: vec![],
+            mtls_role: "service_account".to_string(),
+            mtls_scopes: vec![],
+            tenant_isolation_enabled: true,
+            tenant_id_header: "x-tenant-id".to_string(),
+            workspace_id_header: "x-workspace-id".to_string(),
+            tenant_require_workspace: false,
+            tenant_quota_requests_per_minute: 0,
+            tenant_quota_max_concurrent_requests: 0,
+            tenant_quota_backend: "memory".to_string(),
+            tenant_quota_sled_path: "prompt_sentinel_data/tenant_quota".to_string(),
+            tenant_quota_concurrency_lease_secs: 120,
+            tenant_policy_overlays_path: "config/tenant_policy_overlays.json".to_string(),
+            tenant_policy_overlays_strict: false,
+            audit_storage_policy_path: "config/audit_storage_policies.json".to_string(),
+            audit_storage_policy_strict: false,
+            residency_enforcement_enabled: false,
+            deployment_region: "global".to_string(),
+            oidc_enabled: false,
+            oidc_provider: "generic".to_string(),
+            oidc_issuer_url: None,
+            oidc_audience: None,
+            oidc_client_id: None,
+            oidc_roles_claim: "auto".to_string(),
+            oidc_scopes_claim: "auto".to_string(),
+            oidc_jwks_url: None,
+            oidc_jwks_refresh_interval_secs: 300,
+            oidc_clock_skew_secs: 60,
+            oidc_allow_insecure_jwt_parse: false,
+            bias_threshold: 0.35,
+            max_input_length: 4096,
+            semantic_medium_threshold: 0.70,
+            semantic_high_threshold: 0.80,
+            semantic_decision_margin: 0.02,
+        }
+    }
+
+    fn build_test_router(settings: AppSettings, residency_guard: Option<ResidencyGuard>) -> Router {
+        let audit_storage: Arc<dyn AuditStorage> = Arc::new(InMemoryAuditStorage::new());
+        let audit_logger = AuditLogger::new(audit_storage);
+
+        let mistral_client: Arc<dyn MistralClient> = Arc::new(MockMistralClient::default());
+        let mistral_service = MistralService::new(
+            mistral_client.clone(),
+            settings.generation_model.clone(),
+            settings.moderation_model.clone(),
+            settings.embedding_model.clone(),
+        );
+        let firewall_service = PromptFirewallService::new_with_mistral(
+            settings.max_input_length,
+            mistral_client.clone(),
+        );
+        let bias_service =
+            BiasDetectionService::new_with_mistral(settings.bias_threshold, mistral_client.clone());
+        let semantic_service = SemanticDetectionService::new(
+            mistral_service.clone(),
+            settings.semantic_medium_threshold,
+            settings.semantic_high_threshold,
+            settings.semantic_decision_margin,
+        );
+        let engine = ComplianceEngine::new(
+            firewall_service,
+            semantic_service,
+            bias_service,
+            mistral_service,
+            audit_logger,
+        );
+        let server = PromptSentinelServer::new(settings, engine, residency_guard.map(Arc::new));
+
+        server.build_router()
+    }
+
+    async fn send_post(
+        app: &Router,
+        path: &str,
+        headers: &[(&str, &str)],
+        payload: serde_json::Value,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json");
+
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+
+        let request = builder
+            .body(Body::from(
+                serde_json::to_vec(&payload).expect("request payload should encode"),
+            ))
+            .expect("request should build");
+
+        app.clone()
+            .oneshot(request)
+            .await
+            .expect("router should respond")
+    }
+
+    async fn response_body_text(response: axum::response::Response) -> String {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        String::from_utf8_lossy(&bytes).to_string()
     }
 
     fn write_temp_audit_policy(payload: &str) -> std::path::PathBuf {
