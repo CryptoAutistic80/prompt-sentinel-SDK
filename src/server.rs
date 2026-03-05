@@ -1,10 +1,12 @@
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     http::{HeaderName, HeaderValue, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -24,7 +26,8 @@ use crate::modules::audit::storage::{
     AuditStorage, AuditTrailRequest, AuditTrailResponse, SledAuditStorage,
 };
 use crate::modules::auth::{
-    AuthAdminError, AuthError, AuthService, GenerateCredentialCommand, RotateCredentialCommand,
+    AuthAdminError, AuthContext, AuthError, AuthService, GenerateCredentialCommand,
+    RotateCredentialCommand, TenantScope,
 };
 use crate::modules::bias_detection::service::BiasDetectionService;
 use crate::modules::eu_law_compliance::dtos::{
@@ -50,6 +53,123 @@ pub struct AppState {
     pub engine: Arc<ComplianceEngine>,
     pub startup_complete: Arc<AtomicBool>,
     pub auth_service: Arc<AuthService>,
+    pub tenant_quota_manager: Option<Arc<TenantQuotaManager>>,
+}
+
+#[derive(Clone, Default)]
+struct TenantQuotaState {
+    request_times: VecDeque<Instant>,
+    active_requests: usize,
+}
+
+#[derive(Clone)]
+pub struct TenantQuotaManager {
+    requests_per_minute: u32,
+    max_concurrent_requests: usize,
+    inner: Arc<Mutex<HashMap<String, TenantQuotaState>>>,
+}
+
+impl TenantQuotaManager {
+    fn from_settings(settings: &AppSettings) -> Option<Self> {
+        let requests_per_minute = settings.tenant_quota_requests_per_minute;
+        let max_concurrent_requests = settings.tenant_quota_max_concurrent_requests;
+
+        if requests_per_minute == 0 && max_concurrent_requests == 0 {
+            return None;
+        }
+
+        Some(Self {
+            requests_per_minute,
+            max_concurrent_requests,
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    fn acquire(
+        self: &Arc<Self>,
+        tenant_scope: &TenantScope,
+    ) -> Result<TenantQuotaPermit, TenantQuotaError> {
+        let tenant_id = tenant_scope
+            .tenant_id
+            .as_deref()
+            .ok_or(TenantQuotaError::MissingTenantId)?
+            .to_string();
+
+        let mut guard = self.inner.lock().map_err(|_| TenantQuotaError::Internal)?;
+        let state = guard.entry(tenant_id.clone()).or_default();
+        let now = Instant::now();
+
+        while let Some(front) = state.request_times.front() {
+            if now.duration_since(*front) > Duration::from_secs(60) {
+                state.request_times.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if self.requests_per_minute > 0
+            && state.request_times.len() as u32 >= self.requests_per_minute
+        {
+            return Err(TenantQuotaError::RequestsPerMinuteExceeded {
+                limit: self.requests_per_minute,
+            });
+        }
+
+        if self.max_concurrent_requests > 0 && state.active_requests >= self.max_concurrent_requests
+        {
+            return Err(TenantQuotaError::ConcurrentRequestsExceeded {
+                limit: self.max_concurrent_requests,
+            });
+        }
+
+        if self.requests_per_minute > 0 {
+            state.request_times.push_back(now);
+        }
+        state.active_requests = state.active_requests.saturating_add(1);
+
+        Ok(TenantQuotaPermit {
+            manager: Arc::clone(self),
+            tenant_id,
+            released: false,
+        })
+    }
+
+    fn release(&self, tenant_id: &str) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+
+        if let Some(state) = guard.get_mut(tenant_id) {
+            state.active_requests = state.active_requests.saturating_sub(1);
+            if state.active_requests == 0 && state.request_times.is_empty() {
+                guard.remove(tenant_id);
+            }
+        }
+    }
+}
+
+struct TenantQuotaPermit {
+    manager: Arc<TenantQuotaManager>,
+    tenant_id: String,
+    released: bool,
+}
+
+impl Drop for TenantQuotaPermit {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        self.manager.release(&self.tenant_id);
+        self.released = true;
+    }
+}
+
+#[derive(Debug)]
+enum TenantQuotaError {
+    MissingTenantId,
+    RequestsPerMinuteExceeded { limit: u32 },
+    ConcurrentRequestsExceeded { limit: usize },
+    Internal,
 }
 
 /// Telemetry middleware for request tracking
@@ -144,8 +264,52 @@ async fn auth_middleware(
         .authorize_request(request.headers(), &method, &path)
     {
         Ok(Some(auth_context)) => {
+            let quota_permit = if let Some(quota_manager) = &state.tenant_quota_manager {
+                match quota_manager.acquire(&auth_context.tenant_scope) {
+                    Ok(permit) => Some(permit),
+                    Err(error) => {
+                        let (status, code, message) = match error {
+                            TenantQuotaError::MissingTenantId => (
+                                StatusCode::FORBIDDEN,
+                                "tenant_scope_required",
+                                "tenant scope is required for quota enforcement".to_string(),
+                            ),
+                            TenantQuotaError::RequestsPerMinuteExceeded { limit } => (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "tenant_quota_exceeded",
+                                format!("tenant request quota exceeded (limit_per_minute={limit})"),
+                            ),
+                            TenantQuotaError::ConcurrentRequestsExceeded { limit } => (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "tenant_concurrency_exceeded",
+                                format!("tenant concurrent request quota exceeded (limit={limit})"),
+                            ),
+                            TenantQuotaError::Internal => (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "tenant_quota_internal",
+                                "tenant quota enforcement is unavailable".to_string(),
+                            ),
+                        };
+
+                        get_metrics().increment_errors("tenant_quota");
+                        return (
+                            status,
+                            Json(serde_json::json!({
+                                "error": code,
+                                "message": message,
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+            } else {
+                None
+            };
+
             request.extensions_mut().insert(auth_context);
-            next.run(request).await
+            let response = next.run(request).await;
+            drop(quota_permit);
+            response
         }
         Ok(None) => next.run(request).await,
         Err(error) => {
@@ -155,6 +319,9 @@ async fn auth_middleware(
                 | AuthError::ExpiredCredentials
                 | AuthError::RevokedCredentials => (StatusCode::UNAUTHORIZED, "unauthorized"),
                 AuthError::Forbidden { .. } => (StatusCode::FORBIDDEN, "forbidden"),
+                AuthError::InvalidTenantScope { .. } => {
+                    (StatusCode::FORBIDDEN, "tenant_scope_invalid")
+                }
                 AuthError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
                 AuthError::InternalError => (StatusCode::INTERNAL_SERVER_ERROR, "auth_internal"),
             };
@@ -185,12 +352,14 @@ impl PromptSentinelServer {
         let auth_service = Arc::new(
             AuthService::from_settings(&config).with_audit_logger(engine.audit_logger().clone()),
         );
+        let tenant_quota_manager = TenantQuotaManager::from_settings(&config).map(Arc::new);
         Self {
             config,
             state: AppState {
                 engine: Arc::new(engine),
                 startup_complete: Arc::new(AtomicBool::new(true)),
                 auth_service,
+                tenant_quota_manager,
             },
         }
     }
@@ -640,8 +809,14 @@ async fn update_compliance_config(
 
 async fn check_compliance(
     State(state): State<AppState>,
-    Json(request): Json<ComplianceRequest>,
+    auth_context: Option<Extension<AuthContext>>,
+    Json(mut request): Json<ComplianceRequest>,
 ) -> Result<Json<ComplianceResponse>, (StatusCode, String)> {
+    if let Some(Extension(context)) = auth_context {
+        request.tenant_id = context.tenant_scope.tenant_id;
+        request.workspace_id = context.tenant_scope.workspace_id;
+    }
+
     state
         .engine
         .process(request)
@@ -696,6 +871,21 @@ impl FrameworkConfig {
             auth_rate_limit_per_minute: 300,
             auth_key_store_path: Some("prompt_sentinel_data/auth_keys.json".to_string()),
             auth_default_key_expiry_secs: None,
+            mtls_enabled: false,
+            mtls_verified_header: "x-client-cert-verified".to_string(),
+            mtls_verified_value: "SUCCESS".to_string(),
+            mtls_subject_header: "x-client-cert-subject".to_string(),
+            mtls_fingerprint_header: "x-client-cert-fingerprint".to_string(),
+            mtls_allowed_subjects: vec![],
+            mtls_allowed_fingerprints: vec![],
+            mtls_role: "service_account".to_string(),
+            mtls_scopes: vec![],
+            tenant_isolation_enabled: false,
+            tenant_id_header: "x-tenant-id".to_string(),
+            workspace_id_header: "x-workspace-id".to_string(),
+            tenant_require_workspace: false,
+            tenant_quota_requests_per_minute: 0,
+            tenant_quota_max_concurrent_requests: 0,
             oidc_enabled: false,
             oidc_provider: "generic".to_string(),
             oidc_issuer_url: None,
@@ -808,5 +998,71 @@ impl FrameworkConfig {
         );
 
         Ok(PromptSentinelServer::new(settings, engine))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tenant_quota_enforces_requests_per_minute() {
+        let manager = Arc::new(TenantQuotaManager {
+            requests_per_minute: 2,
+            max_concurrent_requests: 0,
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let scope = TenantScope {
+            tenant_id: Some("tenant-a".to_string()),
+            workspace_id: None,
+        };
+
+        let _permit_1 = manager.acquire(&scope).expect("first request");
+        let _permit_2 = manager.acquire(&scope).expect("second request");
+
+        assert!(matches!(
+            manager.acquire(&scope),
+            Err(TenantQuotaError::RequestsPerMinuteExceeded { limit: 2 })
+        ));
+    }
+
+    #[test]
+    fn tenant_quota_enforces_concurrency_limits() {
+        let manager = Arc::new(TenantQuotaManager {
+            requests_per_minute: 0,
+            max_concurrent_requests: 1,
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let scope = TenantScope {
+            tenant_id: Some("tenant-a".to_string()),
+            workspace_id: None,
+        };
+
+        let permit = manager.acquire(&scope).expect("first request");
+        assert!(matches!(
+            manager.acquire(&scope),
+            Err(TenantQuotaError::ConcurrentRequestsExceeded { limit: 1 })
+        ));
+
+        drop(permit);
+        assert!(manager.acquire(&scope).is_ok());
+    }
+
+    #[test]
+    fn tenant_quota_requires_tenant_scope() {
+        let manager = Arc::new(TenantQuotaManager {
+            requests_per_minute: 10,
+            max_concurrent_requests: 10,
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let scope = TenantScope {
+            tenant_id: None,
+            workspace_id: None,
+        };
+
+        assert!(matches!(
+            manager.acquire(&scope),
+            Err(TenantQuotaError::MissingTenantId)
+        ));
     }
 }

@@ -11,6 +11,8 @@ use super::storage::{AuditStorage, AuditStorageError, StoredAuditRecord};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AuditEvent {
     pub correlation_id: String,
+    pub tenant_id: Option<String>,
+    pub workspace_id: Option<String>,
     pub original_prompt: String,
     pub sanitized_prompt: String,
     pub firewall_action: String,
@@ -55,6 +57,8 @@ pub struct AuthAccessAuditEvent {
     pub timestamp: DateTime<Utc>,
     pub principal_id: Option<String>,
     pub role: Option<String>,
+    pub tenant_id: Option<String>,
+    pub workspace_id: Option<String>,
     pub method: String,
     pub path: String,
     pub outcome: String,

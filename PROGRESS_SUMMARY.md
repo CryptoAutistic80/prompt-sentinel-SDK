@@ -7,7 +7,7 @@ Execution Mode: Phase-by-phase production hardening
 
 ## Current Stage Outcome
 
-This stage advanced **Phase 2 provider-specific OIDC onboarding profiles** by adding tested claim-mapping defaults for Auth0, Okta, Azure AD, and Keycloak.
+This stage advanced the **Phase 2 multi-tenant isolation baseline** by adding tenant/workspace scope enforcement, first-pass tenant quota hooks, and tenant/workspace identifiers in compliance audit payloads.
 
 ### Completed to date in this phase
 
@@ -77,6 +77,37 @@ This stage advanced **Phase 2 provider-specific OIDC onboarding profiles** by ad
 - Added support for claim selector lists and `auto` profiles (`OIDC_ROLES_CLAIM`, `OIDC_SCOPES_CLAIM`).
 - Added OIDC unit tests that verify provider-specific claim mappings for Auth0, Okta, Azure AD, and Keycloak.
 - Updated configuration/docs to default OIDC claim selectors to `auto` (`src/config/settings.rs`, `.env.example`, `README.md`).
+- Added mTLS auth path for requests without API key/bearer credentials:
+  - validates reverse-proxy injected certificate verification header (`MTLS_VERIFIED_HEADER` / `MTLS_VERIFIED_VALUE`)
+  - supports allowlisting by client certificate subject and/or SHA-256 fingerprint
+  - maps accepted mTLS callers to auth context (`role`, `scopes`) with existing RBAC/resource-scope checks
+  - emits explicit auth access outcomes for mTLS allow/deny reasons in audit-access logging
+- Added mTLS configuration surface (`MTLS_*`) in settings, `.env.example`, and README.
+- Added auth unit tests for mTLS:
+  - successful allowlisted subject authorization
+  - deny for unlisted subject
+  - scope-constrained mTLS principal forbidden path
+- Added tenant/workspace scope model to auth context:
+  - `TenantScope` carried in `AuthContext`
+  - configurable tenant/workspace header names
+  - optional strict enforcement when `TENANT_ISOLATION_ENABLED=true`
+- Added OIDC tenant-scope reconciliation:
+  - validates OIDC tenant claim format
+  - denies claim/header tenant mismatches
+- Added tenant quota hooks in auth middleware:
+  - per-tenant requests/minute (`TENANT_QUOTA_REQUESTS_PER_MINUTE`)
+  - per-tenant concurrent in-flight requests (`TENANT_QUOTA_MAX_CONCURRENT_REQUESTS`)
+  - explicit tenant quota error responses for protected routes
+- Extended compliance workflow request/audit schema:
+  - `ComplianceRequest` now carries optional `tenant_id` + `workspace_id`
+  - workflow audit events include `tenant_id` + `workspace_id`
+  - auth access audit events include `tenant_id` + `workspace_id`
+- Added tenant-focused unit tests:
+  - auth tenant scope required path
+  - auth tenant scope propagation path
+  - OIDC tenant mismatch denial
+  - tenant quota request + concurrency + missing-scope enforcement
+- Updated docs/examples (`README.md`, `.env.example`) with `TENANT_*` configuration and behavior notes.
 
 ## Phase Status Dashboard
 
@@ -84,7 +115,7 @@ This stage advanced **Phase 2 provider-specific OIDC onboarding profiles** by ad
 |---|---|---|
 | Phase 0 - Foundation Hardening | In Progress | Core security/reliability foundations implemented; OTel/Sentry/chaos/contract testing remain. |
 | Phase 1 - Provider-Agnostic LLM Support | In Progress | Provider abstraction + backend switching implemented; routing/fallback/cost optimization pending. |
-| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + durable auth access auditing + resource-level permission scaffold implemented; mTLS and full multi-tenant isolation pending. |
+| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + provider-specific onboarding profiles + mTLS auth + durable auth access auditing + resource-level permission scaffold + tenant/workspace isolation baseline + first-pass tenant quota hooks implemented; tenant-specific config overlays and data-residency controls pending. |
 | Phase 3 - Comprehensive EU AI Act Coverage | In Progress | Baseline classification exists; full article-by-article depth pending. |
 | Phase 4 - Audit Trail & Evidence Management | In Progress | Existing audit trail and proofs active; v2 schema + advanced exports/retention lifecycle pending. |
 | Phase 5 - Configuration & Rules Management | In Progress | Env-driven config active; hot reload/staged rollout/rollback/policy-as-code pending. |
@@ -142,12 +173,18 @@ This stage advanced **Phase 2 provider-specific OIDC onboarding profiles** by ad
   - OIDC provider abstraction + bearer-token auth integration.
   - JWT signature verification via JWKS with refreshable key cache.
   - Provider-specific OIDC onboarding profiles with tested claim mappings (Auth0/Okta/Azure AD/Keycloak).
+  - mTLS service-to-service authentication support (proxy-terminated header validation with subject/fingerprint allowlists).
   - Auth access log retrieval.
   - Durable auth access-event persistence into tamper-evident audit storage.
   - Resource-level permission scaffold (project/environment-aware permission candidates + global fallback).
+  - Tenant/workspace scope extraction + enforcement in auth context.
+  - OIDC tenant-claim/header mismatch guardrails.
+  - First-pass tenant quota hooks (per-tenant request/minute and concurrent in-flight limits).
+  - Tenant/workspace identifiers in workflow audit events and auth access audit events.
 - Remaining:
-  - mTLS auth support.
-  - Full multi-tenant isolation and quotas.
+  - Tenant-specific policy/config overlays (firewall, bias, EU keywords, provider prefs).
+  - Persistent/distributed quota backend for multi-instance deployments.
+  - Data residency controls and tenant isolation penetration-test validation.
 
 ## Validation
 
@@ -155,19 +192,25 @@ Commands run for this stage:
 
 - `cargo fmt` -> pass
 - `cargo check` -> pass
+- `cargo test tenant_ -- --nocapture` -> pass
 - `cargo test` -> pass (all suites green; benchmark test intentionally ignored)
 
 ## Files Changed This Stage
 
-- `src/modules/auth/oidc.rs`
+- `src/modules/auth/mod.rs`
+- `src/modules/audit/logger.rs`
 - `src/config/settings.rs`
 - `src/server.rs`
+- `src/workflow/mod.rs`
+- `tests/compliance_flow.rs`
+- `tests/demo.rs`
+- `tests/multilingual_response_test.rs`
 - `.env.example`
 - `README.md`
 - `PROGRESS_SUMMARY.md`
 
 ## Next Execution Slice
 
-1. Add mTLS auth support for service-to-service deployments.
-2. Start multi-tenant isolation baseline (tenant/workspace identifiers + quota hooks).
-3. Add first-pass tenant quota enforcement hooks (request volume and concurrency).
+1. Add persistent/distributed tenant quota backend support for multi-instance deployments.
+2. Add tenant-specific configuration overlays (firewall rules, bias thresholds, EU keyword packs, LLM provider preferences).
+3. Extend audit trail querying/filtering and storage policy controls for tenant/workspace + residency evidence.

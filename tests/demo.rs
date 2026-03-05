@@ -119,6 +119,8 @@ async fn run_demo() {
         let result = engine
             .process(ComplianceRequest {
                 correlation_id: None,
+                tenant_id: None,
+                workspace_id: None,
                 prompt: case.prompt.to_string(),
             })
             .await

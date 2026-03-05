@@ -96,6 +96,21 @@ docker run -d \
 | `AUTH_RATE_LIMIT_PER_MINUTE` | Per-key request limit per 60s | `300` |
 | `AUTH_KEY_STORE_PATH` | Persistent auth key store path | `prompt_sentinel_data/auth_keys.json` |
 | `AUTH_DEFAULT_KEY_EXPIRY_SECS` | Default TTL (seconds) for generated keys | None |
+| `MTLS_ENABLED` | Enable mTLS header-based auth path (proxy-terminated) | `false` |
+| `MTLS_VERIFIED_HEADER` | Header indicating verified client cert | `x-client-cert-verified` |
+| `MTLS_VERIFIED_VALUE` | Required verification header value | `SUCCESS` |
+| `MTLS_SUBJECT_HEADER` | Header carrying client cert subject DN | `x-client-cert-subject` |
+| `MTLS_FINGERPRINT_HEADER` | Header carrying SHA-256 client cert fingerprint | `x-client-cert-fingerprint` |
+| `MTLS_ALLOWED_SUBJECTS` | Comma-separated allowlist of subject DNs | None |
+| `MTLS_ALLOWED_FINGERPRINTS` | Comma-separated allowlist of cert fingerprints | None |
+| `MTLS_ROLE` | Auth role assigned to mTLS principals | `service_account` |
+| `MTLS_SCOPES` | Comma-separated scopes for mTLS principals | None |
+| `TENANT_ISOLATION_ENABLED` | Require tenant scope on authenticated requests | `false` |
+| `TENANT_ID_HEADER` | Header used to resolve tenant identity | `x-tenant-id` |
+| `WORKSPACE_ID_HEADER` | Header used to resolve workspace identity | `x-workspace-id` |
+| `TENANT_REQUIRE_WORKSPACE` | Require workspace when tenant isolation is enabled | `false` |
+| `TENANT_QUOTA_REQUESTS_PER_MINUTE` | Per-tenant request ceiling (0 disables) | `0` |
+| `TENANT_QUOTA_MAX_CONCURRENT_REQUESTS` | Per-tenant active-request limit (0 disables) | `0` |
 | `OIDC_ENABLED` | Enable OIDC bearer-token verification path | `false` |
 | `OIDC_PROVIDER` | `generic`, `auth0`, `okta`, `azure_ad`, `keycloak` | `generic` |
 | `OIDC_ISSUER_URL` | Expected JWT issuer (`iss`) | None |
@@ -177,9 +192,13 @@ Check a prompt for compliance with all framework rules.
 ```json
 {
   "correlation_id": "optional-uuid",
+  "tenant_id": "optional-tenant",
+  "workspace_id": "optional-workspace",
   "prompt": "Your prompt text here"
 }
 ```
+
+When auth middleware resolves tenant/workspace scope from headers or OIDC claims, those values are used for audit attribution.
 
 **Response:**
 ```json
@@ -262,6 +281,18 @@ Provider onboarding profiles (`OIDC_ROLES_CLAIM=auto`, `OIDC_SCOPES_CLAIM=auto`)
 
 `OIDC_ROLES_CLAIM` and `OIDC_SCOPES_CLAIM` also accept explicit claim paths (for example `realm_access.roles`) or comma-separated candidates.
 
+### mTLS Auth (Proxy-Terminated)
+
+When `MTLS_ENABLED=true`, requests without API key / bearer token can authenticate via reverse-proxy injected mTLS headers.  
+Expected default headers:
+
+- `x-client-cert-verified: SUCCESS`
+- `x-client-cert-subject: <subject-dn>` (optional if fingerprint allowlist is used)
+- `x-client-cert-fingerprint: <sha256>` (optional if subject allowlist is used)
+
+Use `MTLS_ALLOWED_SUBJECTS` and/or `MTLS_ALLOWED_FINGERPRINTS` to restrict trusted client certificates.
+Deploy behind a trusted ingress/reverse proxy that strips client-cert headers from external traffic and only injects them after certificate validation.
+
 ### POST /api/auth/keys/generate
 
 Generate a new API credential. The plaintext `token` is returned only once.
@@ -291,6 +322,19 @@ Scope examples:
 - `check:invoke:env:staging`
 
 Global scopes such as `check:invoke` remain valid and act as a fallback.
+
+### Tenant Isolation + Quota Hooks
+
+When `TENANT_ISOLATION_ENABLED=true`, authenticated requests must include a valid tenant identifier
+(`TENANT_ID_HEADER`, default `x-tenant-id`). If `TENANT_REQUIRE_WORKSPACE=true`, workspace scope is
+also required (`WORKSPACE_ID_HEADER`, default `x-workspace-id`).
+
+Quota hooks are middleware-enforced and disabled by default:
+
+- `TENANT_QUOTA_REQUESTS_PER_MINUTE`: rolling 60-second request cap per tenant
+- `TENANT_QUOTA_MAX_CONCURRENT_REQUESTS`: max in-flight requests per tenant
+
+OIDC tokens that provide a tenant claim are reconciled against tenant headers; mismatches are denied.
 
 ### POST /api/auth/keys/rotate
 

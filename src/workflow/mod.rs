@@ -37,6 +37,8 @@ pub enum WorkflowStatus {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ComplianceRequest {
     pub correlation_id: Option<String>,
+    pub tenant_id: Option<String>,
+    pub workspace_id: Option<String>,
     pub prompt: String,
 }
 
@@ -126,24 +128,28 @@ impl ComplianceEngine {
     /// Detect the language of the original prompt
     async fn detect_original_language(&self, prompt: &str) -> String {
         // Default to English if detection fails
-        let Ok(lang_detection) = self.mistral_service.detect_language(prompt.to_owned()).await
+        let Ok(lang_detection) = self
+            .mistral_service
+            .detect_language(prompt.to_owned())
+            .await
         else {
             return "English".to_string();
         };
-        
+
         lang_detection.language
     }
 
     /// Translate text back to the original language
     async fn translate_to_original_language(&self, text: &str, target_language: &str) -> String {
         // If translation fails, return original English text
-        let Ok(translation) = self.mistral_service
+        let Ok(translation) = self
+            .mistral_service
             .translate_text(text.to_owned(), target_language.to_owned())
             .await
         else {
             return text.to_owned();
         };
-        
+
         translation.translated_text
     }
 
@@ -153,6 +159,8 @@ impl ComplianceEngine {
     ) -> Result<ComplianceResponse, WorkflowError> {
         let ComplianceRequest {
             correlation_id: request_correlation_id,
+            tenant_id,
+            workspace_id,
             prompt: original_prompt,
         } = request;
         let correlation_id = generate_correlation_id_from_request(request_correlation_id);
@@ -232,6 +240,8 @@ impl ComplianceEngine {
 
             let proof = self.audit_logger.log_event(AuditEvent {
                 correlation_id: correlation_id.clone(),
+                tenant_id: tenant_id.clone(),
+                workspace_id: workspace_id.clone(),
                 original_prompt: original_prompt.clone(),
                 sanitized_prompt: firewall.sanitized_prompt.clone(),
                 firewall_action: format!("{:?}", firewall.action),
@@ -303,6 +313,8 @@ impl ComplianceEngine {
 
             let proof = self.audit_logger.log_event(AuditEvent {
                 correlation_id: correlation_id.clone(),
+                tenant_id: tenant_id.clone(),
+                workspace_id: workspace_id.clone(),
                 original_prompt: original_prompt.clone(),
                 sanitized_prompt: firewall.sanitized_prompt.clone(),
                 firewall_action: format!("{:?}", firewall.action),
@@ -394,6 +406,8 @@ impl ComplianceEngine {
 
             let proof = self.audit_logger.log_event(AuditEvent {
                 correlation_id: correlation_id.clone(),
+                tenant_id: tenant_id.clone(),
+                workspace_id: workspace_id.clone(),
                 original_prompt: original_prompt.clone(),
                 sanitized_prompt: firewall.sanitized_prompt.clone(),
                 firewall_action: format!("{:?}", firewall.action),
@@ -467,6 +481,8 @@ impl ComplianceEngine {
 
             let proof = self.audit_logger.log_event(AuditEvent {
                 correlation_id: correlation_id.clone(),
+                tenant_id: tenant_id.clone(),
+                workspace_id: workspace_id.clone(),
                 original_prompt: original_prompt.clone(),
                 sanitized_prompt: firewall.sanitized_prompt.clone(),
                 firewall_action: format!("{:?}", firewall.action),
@@ -542,7 +558,8 @@ impl ComplianceEngine {
         // Translate generated text back to original language if needed
         let was_translated = original_language.to_lowercase() != "english";
         let generated_text = if was_translated {
-            self.translate_to_original_language(&english_output, &original_language).await
+            self.translate_to_original_language(&english_output, &original_language)
+                .await
         } else {
             english_output.clone()
         };
@@ -584,6 +601,8 @@ impl ComplianceEngine {
 
             let proof = self.audit_logger.log_event(AuditEvent {
                 correlation_id: correlation_id.clone(),
+                tenant_id: tenant_id.clone(),
+                workspace_id: workspace_id.clone(),
                 original_prompt: original_prompt.clone(),
                 sanitized_prompt: firewall.sanitized_prompt.clone(),
                 firewall_action: format!("{:?}", firewall.action),
@@ -673,6 +692,8 @@ impl ComplianceEngine {
 
         let proof = self.audit_logger.log_event(AuditEvent {
             correlation_id: correlation_id.clone(),
+            tenant_id: tenant_id.clone(),
+            workspace_id: workspace_id.clone(),
             original_prompt,
             sanitized_prompt: firewall.sanitized_prompt.clone(),
             firewall_action: format!("{:?}", firewall.action),

@@ -31,7 +31,14 @@ pub struct AuthContext {
     pub role: String,
     pub is_service_account: bool,
     pub scopes: Vec<String>,
+    pub tenant_scope: TenantScope,
     pub resource_scope: ResourceScope,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TenantScope {
+    pub tenant_id: Option<String>,
+    pub workspace_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -312,6 +319,105 @@ impl RateLimiter {
     }
 }
 
+#[derive(Clone, Debug)]
+struct MtlsPolicy {
+    verified_header: String,
+    verified_value: String,
+    subject_header: String,
+    fingerprint_header: String,
+    allowed_subjects: HashSet<String>,
+    allowed_fingerprints: HashSet<String>,
+    role: String,
+    scopes: Vec<String>,
+}
+
+impl MtlsPolicy {
+    fn from_settings(settings: &AppSettings) -> Option<Self> {
+        if !settings.mtls_enabled {
+            return None;
+        }
+
+        let verified_header = normalize_header_name(&settings.mtls_verified_header)
+            .unwrap_or_else(|| "x-client-cert-verified".to_string());
+        let verified_value = {
+            let trimmed = settings.mtls_verified_value.trim();
+            if trimmed.is_empty() {
+                "SUCCESS".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        };
+        let subject_header = normalize_header_name(&settings.mtls_subject_header)
+            .unwrap_or_else(|| "x-client-cert-subject".to_string());
+        let fingerprint_header = normalize_header_name(&settings.mtls_fingerprint_header)
+            .unwrap_or_else(|| "x-client-cert-fingerprint".to_string());
+
+        let allowed_subjects = settings
+            .mtls_allowed_subjects
+            .iter()
+            .filter_map(|subject| normalize_mtls_subject(subject))
+            .collect::<HashSet<_>>();
+        let allowed_fingerprints = settings
+            .mtls_allowed_fingerprints
+            .iter()
+            .filter_map(|fingerprint| normalize_mtls_fingerprint(fingerprint))
+            .collect::<HashSet<_>>();
+
+        if allowed_subjects.is_empty() && allowed_fingerprints.is_empty() {
+            warn!(
+                "MTLS_ENABLED=true but no MTLS_ALLOWED_SUBJECTS/MTLS_ALLOWED_FINGERPRINTS configured; any verified client certificate will be accepted"
+            );
+        }
+
+        let role = {
+            let trimmed = settings.mtls_role.trim();
+            if trimmed.is_empty() {
+                "service_account".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        };
+        let scopes = normalize_scopes(settings.mtls_scopes.clone());
+
+        Some(Self {
+            verified_header,
+            verified_value,
+            subject_header,
+            fingerprint_header,
+            allowed_subjects,
+            allowed_fingerprints,
+            role,
+            scopes,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TenantPolicy {
+    tenant_header: String,
+    workspace_header: String,
+    require_workspace: bool,
+}
+
+impl TenantPolicy {
+    fn from_settings(settings: &AppSettings) -> Option<Self> {
+        if !settings.tenant_isolation_enabled {
+            return None;
+        }
+
+        let tenant_header = normalize_header_name(&settings.tenant_id_header)
+            .unwrap_or_else(|| "x-tenant-id".to_string());
+        let workspace_header = normalize_header_name(&settings.workspace_id_header)
+            .unwrap_or_else(|| "x-workspace-id".to_string());
+
+        Some(Self {
+            tenant_header,
+            workspace_header,
+            require_workspace: settings.tenant_require_workspace,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct CredentialMetadata {
     pub key_id: String,
@@ -332,6 +438,8 @@ pub struct AccessAuditEvent {
     pub timestamp: DateTime<Utc>,
     pub principal_id: Option<String>,
     pub role: Option<String>,
+    pub tenant_id: Option<String>,
+    pub workspace_id: Option<String>,
     pub method: String,
     pub path: String,
     pub outcome: String,
@@ -372,6 +480,8 @@ pub struct AuthService {
     rate_limiter: Option<RateLimiter>,
     access_events: Arc<Mutex<VecDeque<AccessAuditEvent>>>,
     audit_logger: Option<AuditLogger>,
+    mtls_policy: Option<MtlsPolicy>,
+    tenant_policy: Option<TenantPolicy>,
     credential_store: Option<CredentialStore>,
     default_key_expiry_secs: Option<u64>,
     oidc_verifier: Option<Arc<dyn OidcTokenVerifier + Send + Sync>>,
@@ -433,6 +543,8 @@ impl AuthService {
         } else {
             None
         };
+        let mtls_policy = MtlsPolicy::from_settings(settings);
+        let tenant_policy = TenantPolicy::from_settings(settings);
 
         Self {
             enabled: settings.auth_enabled,
@@ -440,6 +552,8 @@ impl AuthService {
             rate_limiter,
             access_events: Arc::new(Mutex::new(VecDeque::new())),
             audit_logger: None,
+            mtls_policy,
+            tenant_policy,
             credential_store,
             default_key_expiry_secs: settings.auth_default_key_expiry_secs,
             oidc_verifier,
@@ -465,6 +579,7 @@ impl AuthService {
             return Ok(None);
         }
 
+        let tenant_scope = extract_tenant_scope(headers, self.tenant_policy.as_ref());
         let resource_scope = extract_resource_scope(headers);
         let required_permissions = required_permissions(method, path, &resource_scope);
         let required_permission = required_permissions.first().cloned();
@@ -474,11 +589,26 @@ impl AuthService {
 
         let credentials = extract_credentials(headers);
         if credentials.api_key.is_none() && credentials.bearer.is_none() {
+            if let Some(mtls_result) = self.authorize_with_mtls(
+                headers,
+                method,
+                path,
+                &tenant_scope,
+                &resource_scope,
+                &required_permissions,
+                &required_permission,
+                &correlation_id,
+            ) {
+                return mtls_result.map(Some);
+            }
+
             self.record_access(AccessAuditEvent {
                 correlation_id: correlation_id.clone(),
                 timestamp: Utc::now(),
                 principal_id: None,
                 role: None,
+                tenant_id: tenant_scope.tenant_id.clone(),
+                workspace_id: tenant_scope.workspace_id.clone(),
                 method: method_str.clone(),
                 path: path_str.clone(),
                 outcome: "deny_missing_credentials".to_string(),
@@ -494,6 +624,7 @@ impl AuthService {
                     token,
                     method,
                     path,
+                    &tenant_scope,
                     &resource_scope,
                     &required_permissions,
                     &required_permission,
@@ -512,6 +643,7 @@ impl AuthService {
                         token,
                         method,
                         path,
+                        &tenant_scope,
                         &resource_scope,
                         &required_permissions,
                         &required_permission,
@@ -525,6 +657,7 @@ impl AuthService {
                     token,
                     method,
                     path,
+                    &tenant_scope,
                     &resource_scope,
                     &required_permissions,
                     &required_permission,
@@ -541,6 +674,7 @@ impl AuthService {
         token: &str,
         method: &Method,
         path: &str,
+        tenant_scope: &TenantScope,
         resource_scope: &ResourceScope,
         required_permissions: &[String],
         required_permission: &Option<String>,
@@ -554,6 +688,8 @@ impl AuthService {
                     timestamp: Utc::now(),
                     principal_id: None,
                     role: None,
+                    tenant_id: tenant_scope.tenant_id.clone(),
+                    workspace_id: tenant_scope.workspace_id.clone(),
                     method: method.as_str().to_owned(),
                     path: path.to_owned(),
                     outcome: "deny_internal_error".to_string(),
@@ -571,6 +707,8 @@ impl AuthService {
                 timestamp: Utc::now(),
                 principal_id: None,
                 role: None,
+                tenant_id: tenant_scope.tenant_id.clone(),
+                workspace_id: tenant_scope.workspace_id.clone(),
                 method: method.as_str().to_owned(),
                 path: path.to_owned(),
                 outcome: "deny_invalid_credentials".to_string(),
@@ -586,6 +724,8 @@ impl AuthService {
                 timestamp: Utc::now(),
                 principal_id: Some(entry.key_id.clone()),
                 role: Some(entry.role.clone()),
+                tenant_id: tenant_scope.tenant_id.clone(),
+                workspace_id: tenant_scope.workspace_id.clone(),
                 method: method.as_str().to_owned(),
                 path: path.to_owned(),
                 outcome: "deny_revoked_credentials".to_string(),
@@ -601,6 +741,8 @@ impl AuthService {
                 timestamp: Utc::now(),
                 principal_id: Some(entry.key_id.clone()),
                 role: Some(entry.role.clone()),
+                tenant_id: tenant_scope.tenant_id.clone(),
+                workspace_id: tenant_scope.workspace_id.clone(),
                 method: method.as_str().to_owned(),
                 path: path.to_owned(),
                 outcome: "deny_expired_credentials".to_string(),
@@ -610,6 +752,16 @@ impl AuthService {
             return Err(AuthError::ExpiredCredentials);
         }
 
+        self.enforce_tenant_scope(
+            tenant_scope,
+            &entry.key_id,
+            &entry.role,
+            method,
+            path,
+            required_permission,
+            correlation_id,
+        )?;
+
         if let Some(rate_limiter) = &self.rate_limiter
             && !rate_limiter.allow(&entry.key_id)
         {
@@ -618,6 +770,8 @@ impl AuthService {
                 timestamp: Utc::now(),
                 principal_id: Some(entry.key_id.clone()),
                 role: Some(entry.role.clone()),
+                tenant_id: tenant_scope.tenant_id.clone(),
+                workspace_id: tenant_scope.workspace_id.clone(),
                 method: method.as_str().to_owned(),
                 path: path.to_owned(),
                 outcome: "deny_rate_limited".to_string(),
@@ -633,6 +787,8 @@ impl AuthService {
                 timestamp: Utc::now(),
                 principal_id: Some(entry.key_id.clone()),
                 role: Some(entry.role.clone()),
+                tenant_id: tenant_scope.tenant_id.clone(),
+                workspace_id: tenant_scope.workspace_id.clone(),
                 method: method.as_str().to_owned(),
                 path: path.to_owned(),
                 outcome: "deny_forbidden".to_string(),
@@ -654,6 +810,8 @@ impl AuthService {
             timestamp: Utc::now(),
             principal_id: Some(entry.key_id.clone()),
             role: Some(entry.role.clone()),
+            tenant_id: tenant_scope.tenant_id.clone(),
+            workspace_id: tenant_scope.workspace_id.clone(),
             method: method.as_str().to_owned(),
             path: path.to_owned(),
             outcome: "allow".to_string(),
@@ -669,6 +827,7 @@ impl AuthService {
             role: entry.role,
             is_service_account: entry.is_service_account,
             scopes: entry.scopes,
+            tenant_scope: tenant_scope.clone(),
             resource_scope: resource_scope.clone(),
         })
     }
@@ -679,6 +838,7 @@ impl AuthService {
         token: &str,
         method: &Method,
         path: &str,
+        tenant_scope: &TenantScope,
         resource_scope: &ResourceScope,
         required_permissions: &[String],
         required_permission: &Option<String>,
@@ -705,6 +865,8 @@ impl AuthService {
                 timestamp: Utc::now(),
                 principal_id: None,
                 role: None,
+                tenant_id: tenant_scope.tenant_id.clone(),
+                workspace_id: tenant_scope.workspace_id.clone(),
                 method: method.as_str().to_owned(),
                 path: path.to_owned(),
                 outcome: "deny_oidc_verification_failed".to_string(),
@@ -715,14 +877,26 @@ impl AuthService {
         })?;
 
         let principal_id = format!("oidc_{}", principal.subject);
+        let resolved_tenant_scope = self.resolve_oidc_tenant_scope(
+            tenant_scope,
+            &principal,
+            &principal_id,
+            method,
+            path,
+            required_permission,
+            correlation_id,
+        )?;
+
         if let Some(rate_limiter) = &self.rate_limiter
             && !rate_limiter.allow(&principal_id)
         {
             self.record_access(AccessAuditEvent {
                 correlation_id: correlation_id.clone(),
                 timestamp: Utc::now(),
-                principal_id: Some(principal_id),
+                principal_id: Some(principal_id.clone()),
                 role: Some(principal.primary_role().to_owned()),
+                tenant_id: resolved_tenant_scope.tenant_id.clone(),
+                workspace_id: resolved_tenant_scope.workspace_id.clone(),
                 method: method.as_str().to_owned(),
                 path: path.to_owned(),
                 outcome: "deny_rate_limited".to_string(),
@@ -740,6 +914,8 @@ impl AuthService {
                 timestamp: Utc::now(),
                 principal_id: Some(format!("oidc_{}", principal.subject)),
                 role: Some(principal.primary_role().to_owned()),
+                tenant_id: resolved_tenant_scope.tenant_id.clone(),
+                workspace_id: resolved_tenant_scope.workspace_id.clone(),
                 method: method.as_str().to_owned(),
                 path: path.to_owned(),
                 outcome: "deny_forbidden".to_string(),
@@ -761,6 +937,8 @@ impl AuthService {
             timestamp: Utc::now(),
             principal_id: Some(format!("oidc_{}", principal.subject)),
             role: Some(principal.primary_role().to_owned()),
+            tenant_id: resolved_tenant_scope.tenant_id.clone(),
+            workspace_id: resolved_tenant_scope.workspace_id.clone(),
             method: method.as_str().to_owned(),
             path: path.to_owned(),
             outcome: "allow".to_string(),
@@ -777,8 +955,374 @@ impl AuthService {
             role: principal.primary_role().to_owned(),
             is_service_account: false,
             scopes: principal.scopes,
+            tenant_scope: resolved_tenant_scope,
             resource_scope: resource_scope.clone(),
         })
+    }
+
+    fn authorize_with_mtls(
+        &self,
+        headers: &HeaderMap,
+        method: &Method,
+        path: &str,
+        tenant_scope: &TenantScope,
+        resource_scope: &ResourceScope,
+        required_permissions: &[String],
+        required_permission: &Option<String>,
+        correlation_id: &Option<String>,
+    ) -> Option<Result<AuthContext, AuthError>> {
+        let policy = self.mtls_policy.as_ref()?;
+        let verified_header = extract_optional_header(headers, &policy.verified_header);
+        let subject_raw = extract_optional_header(headers, &policy.subject_header);
+        let fingerprint_raw = extract_optional_header(headers, &policy.fingerprint_header);
+
+        if verified_header.is_none() && subject_raw.is_none() && fingerprint_raw.is_none() {
+            return None;
+        }
+
+        let verified = verified_header
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case(policy.verified_value.as_str()))
+            .unwrap_or(false);
+
+        if !verified {
+            self.record_access(AccessAuditEvent {
+                correlation_id: correlation_id.clone(),
+                timestamp: Utc::now(),
+                principal_id: None,
+                role: Some(policy.role.clone()),
+                tenant_id: tenant_scope.tenant_id.clone(),
+                workspace_id: tenant_scope.workspace_id.clone(),
+                method: method.as_str().to_owned(),
+                path: path.to_owned(),
+                outcome: "deny_mtls_unverified".to_string(),
+                required_permission: required_permission.clone(),
+                detail: Some(format!(
+                    "expected {}={}",
+                    policy.verified_header, policy.verified_value
+                )),
+            });
+            return Some(Err(AuthError::InvalidCredentials));
+        }
+
+        let subject = subject_raw
+            .as_deref()
+            .and_then(normalize_mtls_subject)
+            .map(|value| value.to_string());
+        let fingerprint = fingerprint_raw
+            .as_deref()
+            .and_then(normalize_mtls_fingerprint)
+            .map(|value| value.to_string());
+
+        if !policy.allowed_subjects.is_empty() {
+            let Some(subject_value) = subject.as_deref() else {
+                self.record_access(AccessAuditEvent {
+                    correlation_id: correlation_id.clone(),
+                    timestamp: Utc::now(),
+                    principal_id: None,
+                    role: Some(policy.role.clone()),
+                    tenant_id: tenant_scope.tenant_id.clone(),
+                    workspace_id: tenant_scope.workspace_id.clone(),
+                    method: method.as_str().to_owned(),
+                    path: path.to_owned(),
+                    outcome: "deny_mtls_subject_missing".to_string(),
+                    required_permission: required_permission.clone(),
+                    detail: Some(format!(
+                        "subject header `{}` missing or invalid",
+                        policy.subject_header
+                    )),
+                });
+                return Some(Err(AuthError::InvalidCredentials));
+            };
+
+            if !policy.allowed_subjects.contains(subject_value) {
+                self.record_access(AccessAuditEvent {
+                    correlation_id: correlation_id.clone(),
+                    timestamp: Utc::now(),
+                    principal_id: None,
+                    role: Some(policy.role.clone()),
+                    tenant_id: tenant_scope.tenant_id.clone(),
+                    workspace_id: tenant_scope.workspace_id.clone(),
+                    method: method.as_str().to_owned(),
+                    path: path.to_owned(),
+                    outcome: "deny_mtls_subject_not_allowed".to_string(),
+                    required_permission: required_permission.clone(),
+                    detail: Some("subject not allowlisted".to_string()),
+                });
+                return Some(Err(AuthError::InvalidCredentials));
+            }
+        }
+
+        if !policy.allowed_fingerprints.is_empty() {
+            let Some(fingerprint_value) = fingerprint.as_deref() else {
+                self.record_access(AccessAuditEvent {
+                    correlation_id: correlation_id.clone(),
+                    timestamp: Utc::now(),
+                    principal_id: None,
+                    role: Some(policy.role.clone()),
+                    tenant_id: tenant_scope.tenant_id.clone(),
+                    workspace_id: tenant_scope.workspace_id.clone(),
+                    method: method.as_str().to_owned(),
+                    path: path.to_owned(),
+                    outcome: "deny_mtls_fingerprint_missing".to_string(),
+                    required_permission: required_permission.clone(),
+                    detail: Some(format!(
+                        "fingerprint header `{}` missing or invalid",
+                        policy.fingerprint_header
+                    )),
+                });
+                return Some(Err(AuthError::InvalidCredentials));
+            };
+
+            if !policy.allowed_fingerprints.contains(fingerprint_value) {
+                self.record_access(AccessAuditEvent {
+                    correlation_id: correlation_id.clone(),
+                    timestamp: Utc::now(),
+                    principal_id: None,
+                    role: Some(policy.role.clone()),
+                    tenant_id: tenant_scope.tenant_id.clone(),
+                    workspace_id: tenant_scope.workspace_id.clone(),
+                    method: method.as_str().to_owned(),
+                    path: path.to_owned(),
+                    outcome: "deny_mtls_fingerprint_not_allowed".to_string(),
+                    required_permission: required_permission.clone(),
+                    detail: Some("fingerprint not allowlisted".to_string()),
+                });
+                return Some(Err(AuthError::InvalidCredentials));
+            }
+        }
+
+        let principal_id = fingerprint
+            .as_deref()
+            .map(principal_id_from_fingerprint)
+            .or_else(|| subject.as_deref().map(principal_id_from_subject))
+            .unwrap_or_else(|| "mtls_unknown".to_string());
+
+        if let Err(error) = self.enforce_tenant_scope(
+            tenant_scope,
+            &principal_id,
+            &policy.role,
+            method,
+            path,
+            required_permission,
+            correlation_id,
+        ) {
+            return Some(Err(error));
+        }
+
+        if let Some(rate_limiter) = &self.rate_limiter
+            && !rate_limiter.allow(&principal_id)
+        {
+            self.record_access(AccessAuditEvent {
+                correlation_id: correlation_id.clone(),
+                timestamp: Utc::now(),
+                principal_id: Some(principal_id.clone()),
+                role: Some(policy.role.clone()),
+                tenant_id: tenant_scope.tenant_id.clone(),
+                workspace_id: tenant_scope.workspace_id.clone(),
+                method: method.as_str().to_owned(),
+                path: path.to_owned(),
+                outcome: "deny_rate_limited".to_string(),
+                required_permission: required_permission.clone(),
+                detail: Some("auth_mechanism=mtls".to_string()),
+            });
+            return Some(Err(AuthError::RateLimited));
+        }
+
+        if !required_permissions.is_empty()
+            && !role_and_scopes_have_any_permission(
+                policy.role.as_str(),
+                &policy.scopes,
+                required_permissions,
+            )
+        {
+            self.record_access(AccessAuditEvent {
+                correlation_id: correlation_id.clone(),
+                timestamp: Utc::now(),
+                principal_id: Some(principal_id.clone()),
+                role: Some(policy.role.clone()),
+                tenant_id: tenant_scope.tenant_id.clone(),
+                workspace_id: tenant_scope.workspace_id.clone(),
+                method: method.as_str().to_owned(),
+                path: path.to_owned(),
+                outcome: "deny_forbidden".to_string(),
+                required_permission: required_permission.clone(),
+                detail: Some(format!(
+                    "missing required permission candidates: {}",
+                    required_permissions.join(", ")
+                )),
+            });
+            return Some(Err(AuthError::Forbidden {
+                required_permission: required_permission
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+            }));
+        }
+
+        self.record_access(AccessAuditEvent {
+            correlation_id: correlation_id.clone(),
+            timestamp: Utc::now(),
+            principal_id: Some(principal_id.clone()),
+            role: Some(policy.role.clone()),
+            tenant_id: tenant_scope.tenant_id.clone(),
+            workspace_id: tenant_scope.workspace_id.clone(),
+            method: method.as_str().to_owned(),
+            path: path.to_owned(),
+            outcome: "allow".to_string(),
+            required_permission: required_permission.clone(),
+            detail: Some(format!(
+                "auth_mechanism=mtls{}{}",
+                format_mtls_subject_suffix(subject.as_deref()),
+                format_resource_scope_suffix(resource_scope),
+            )),
+        });
+
+        Some(Ok(AuthContext {
+            principal_id,
+            role: policy.role.clone(),
+            is_service_account: true,
+            scopes: policy.scopes.clone(),
+            tenant_scope: tenant_scope.clone(),
+            resource_scope: resource_scope.clone(),
+        }))
+    }
+
+    fn resolve_oidc_tenant_scope(
+        &self,
+        tenant_scope_from_headers: &TenantScope,
+        principal: &OidcPrincipal,
+        principal_id: &str,
+        method: &Method,
+        path: &str,
+        required_permission: &Option<String>,
+        correlation_id: &Option<String>,
+    ) -> Result<TenantScope, AuthError> {
+        let principal_tenant = match principal.tenant_id.as_deref() {
+            Some(raw) => {
+                let normalized = normalize_resource_segment(raw);
+                if normalized.is_none() {
+                    self.record_access(AccessAuditEvent {
+                        correlation_id: correlation_id.clone(),
+                        timestamp: Utc::now(),
+                        principal_id: Some(principal_id.to_string()),
+                        role: Some(principal.primary_role().to_owned()),
+                        tenant_id: tenant_scope_from_headers.tenant_id.clone(),
+                        workspace_id: tenant_scope_from_headers.workspace_id.clone(),
+                        method: method.as_str().to_owned(),
+                        path: path.to_owned(),
+                        outcome: "deny_tenant_scope_invalid".to_string(),
+                        required_permission: required_permission.clone(),
+                        detail: Some("OIDC tenant claim is invalid".to_string()),
+                    });
+                    return Err(AuthError::InvalidTenantScope {
+                        detail: "OIDC tenant claim is invalid".to_string(),
+                    });
+                }
+                normalized
+            }
+            None => None,
+        };
+
+        if let (Some(claim_tenant), Some(header_tenant)) = (
+            principal_tenant.as_deref(),
+            tenant_scope_from_headers.tenant_id.as_deref(),
+        ) && claim_tenant != header_tenant
+        {
+            self.record_access(AccessAuditEvent {
+                correlation_id: correlation_id.clone(),
+                timestamp: Utc::now(),
+                principal_id: Some(principal_id.to_string()),
+                role: Some(principal.primary_role().to_owned()),
+                tenant_id: Some(header_tenant.to_string()),
+                workspace_id: tenant_scope_from_headers.workspace_id.clone(),
+                method: method.as_str().to_owned(),
+                path: path.to_owned(),
+                outcome: "deny_tenant_scope_mismatch".to_string(),
+                required_permission: required_permission.clone(),
+                detail: Some("OIDC tenant claim does not match tenant header".to_string()),
+            });
+            return Err(AuthError::InvalidTenantScope {
+                detail: "OIDC tenant claim does not match tenant header".to_string(),
+            });
+        }
+
+        let resolved_scope = TenantScope {
+            tenant_id: principal_tenant.or_else(|| tenant_scope_from_headers.tenant_id.clone()),
+            workspace_id: tenant_scope_from_headers.workspace_id.clone(),
+        };
+
+        self.enforce_tenant_scope(
+            &resolved_scope,
+            principal_id,
+            principal.primary_role(),
+            method,
+            path,
+            required_permission,
+            correlation_id,
+        )?;
+
+        Ok(resolved_scope)
+    }
+
+    fn enforce_tenant_scope(
+        &self,
+        tenant_scope: &TenantScope,
+        principal_id: &str,
+        role: &str,
+        method: &Method,
+        path: &str,
+        required_permission: &Option<String>,
+        correlation_id: &Option<String>,
+    ) -> Result<(), AuthError> {
+        let Some(policy) = &self.tenant_policy else {
+            return Ok(());
+        };
+
+        if tenant_scope.tenant_id.is_none() {
+            self.record_access(AccessAuditEvent {
+                correlation_id: correlation_id.clone(),
+                timestamp: Utc::now(),
+                principal_id: Some(principal_id.to_string()),
+                role: Some(role.to_string()),
+                tenant_id: None,
+                workspace_id: tenant_scope.workspace_id.clone(),
+                method: method.as_str().to_owned(),
+                path: path.to_owned(),
+                outcome: "deny_tenant_scope_missing".to_string(),
+                required_permission: required_permission.clone(),
+                detail: Some(format!(
+                    "tenant header `{}` is required",
+                    policy.tenant_header
+                )),
+            });
+            return Err(AuthError::InvalidTenantScope {
+                detail: "tenant_id is required for this deployment".to_string(),
+            });
+        }
+
+        if policy.require_workspace && tenant_scope.workspace_id.is_none() {
+            self.record_access(AccessAuditEvent {
+                correlation_id: correlation_id.clone(),
+                timestamp: Utc::now(),
+                principal_id: Some(principal_id.to_string()),
+                role: Some(role.to_string()),
+                tenant_id: tenant_scope.tenant_id.clone(),
+                workspace_id: None,
+                method: method.as_str().to_owned(),
+                path: path.to_owned(),
+                outcome: "deny_tenant_scope_missing".to_string(),
+                required_permission: required_permission.clone(),
+                detail: Some(format!(
+                    "workspace header `{}` is required",
+                    policy.workspace_header
+                )),
+            });
+            return Err(AuthError::InvalidTenantScope {
+                detail: "workspace_id is required for this deployment".to_string(),
+            });
+        }
+
+        Ok(())
     }
 
     pub fn list_credentials(&self) -> Result<Vec<CredentialMetadata>, AuthAdminError> {
@@ -1025,6 +1569,8 @@ impl AuthService {
                 timestamp: event.timestamp,
                 principal_id: event.principal_id,
                 role: event.role,
+                tenant_id: event.tenant_id,
+                workspace_id: event.workspace_id,
                 method: event.method,
                 path: event.path,
                 outcome: event.outcome,
@@ -1051,6 +1597,8 @@ pub enum AuthError {
     RevokedCredentials,
     #[error("forbidden: missing permission `{required_permission}`")]
     Forbidden { required_permission: String },
+    #[error("tenant scope invalid: {detail}")]
+    InvalidTenantScope { detail: String },
     #[error("rate limit exceeded")]
     RateLimited,
     #[error("authentication system unavailable")]
@@ -1136,6 +1684,79 @@ fn extract_correlation_id(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn extract_optional_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn extract_tenant_scope(headers: &HeaderMap, policy: Option<&TenantPolicy>) -> TenantScope {
+    let tenant_header = policy
+        .map(|configured| configured.tenant_header.as_str())
+        .unwrap_or("x-tenant-id");
+    let workspace_header = policy
+        .map(|configured| configured.workspace_header.as_str())
+        .unwrap_or("x-workspace-id");
+
+    TenantScope {
+        tenant_id: extract_resource_header(headers, tenant_header),
+        workspace_id: extract_resource_header(headers, workspace_header),
+    }
+}
+
+fn normalize_header_name(raw: &str) -> Option<String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if normalized
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn normalize_mtls_subject(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_ascii_lowercase())
+    }
+}
+
+fn normalize_mtls_fingerprint(raw: &str) -> Option<String> {
+    let normalized = raw
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    if normalized.len() == 64 {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn principal_id_from_fingerprint(fingerprint: &str) -> String {
+    let prefix = &fingerprint[..12.min(fingerprint.len())];
+    format!("mtls_{prefix}")
+}
+
+fn principal_id_from_subject(subject: &str) -> String {
+    let subject_hash = hash_token(subject);
+    let prefix = &subject_hash[..12.min(subject_hash.len())];
+    format!("mtls_{prefix}")
+}
+
 fn extract_resource_scope(headers: &HeaderMap) -> ResourceScope {
     ResourceScope {
         project_id: extract_resource_header(headers, "x-project-id"),
@@ -1180,6 +1801,12 @@ fn format_resource_scope_suffix(resource_scope: &ResourceScope) -> String {
     } else {
         format!("; {}", parts.join("; "))
     }
+}
+
+fn format_mtls_subject_suffix(subject: Option<&str>) -> String {
+    subject
+        .map(|value| format!("; subject={value}"))
+        .unwrap_or_default()
 }
 
 fn required_permissions(
@@ -1258,6 +1885,28 @@ fn permission_match(candidate: &str, required: &str) -> bool {
     }
 
     false
+}
+
+fn role_and_scopes_have_permission(role: &str, scopes: &[String], required: &str) -> bool {
+    if scopes.is_empty() {
+        return permissions_for_role(role)
+            .iter()
+            .any(|candidate| permission_match(candidate, required));
+    }
+
+    scopes
+        .iter()
+        .any(|candidate| permission_match(candidate, required))
+}
+
+fn role_and_scopes_have_any_permission(
+    role: &str,
+    scopes: &[String],
+    required_permissions: &[String],
+) -> bool {
+    required_permissions
+        .iter()
+        .any(|required| role_and_scopes_have_permission(role, scopes, required))
 }
 
 fn principal_has_permission(principal: &OidcPrincipal, required: &str) -> bool {
@@ -1402,6 +2051,155 @@ mod tests {
         assert!(limiter.allow("abc"));
         assert!(limiter.allow("abc"));
         assert!(!limiter.allow("abc"));
+    }
+
+    #[test]
+    fn mtls_authorizes_service_request_with_allowed_subject() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+        settings.mtls_enabled = true;
+        settings.mtls_allowed_subjects = vec!["CN=svc-compliance".to_string()];
+
+        let service = AuthService::from_settings(&settings);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-client-cert-verified", "SUCCESS".parse().expect("header"));
+        headers.insert(
+            "x-client-cert-subject",
+            "CN=svc-compliance".parse().expect("header"),
+        );
+
+        let result = service.authorize_request(&headers, &Method::POST, "/api/compliance/check");
+        let context = result
+            .expect("auth should succeed")
+            .expect("context should exist");
+
+        assert!(context.principal_id.starts_with("mtls_"));
+        assert_eq!(context.role, "service_account");
+        assert!(context.is_service_account);
+    }
+
+    #[test]
+    fn mtls_denies_unlisted_subject() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+        settings.mtls_enabled = true;
+        settings.mtls_allowed_subjects = vec!["CN=svc-allowed".to_string()];
+
+        let service = AuthService::from_settings(&settings);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-client-cert-verified", "SUCCESS".parse().expect("header"));
+        headers.insert(
+            "x-client-cert-subject",
+            "CN=svc-denied".parse().expect("header"),
+        );
+
+        let result = service.authorize_request(&headers, &Method::POST, "/api/compliance/check");
+        assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+    }
+
+    #[test]
+    fn mtls_scopes_can_constrain_permissions() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+        settings.mtls_enabled = true;
+        settings.mtls_allowed_subjects = vec!["CN=svc-compliance".to_string()];
+        settings.mtls_scopes = vec!["llm:read".to_string()];
+
+        let service = AuthService::from_settings(&settings);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-client-cert-verified", "SUCCESS".parse().expect("header"));
+        headers.insert(
+            "x-client-cert-subject",
+            "CN=svc-compliance".parse().expect("header"),
+        );
+
+        let result = service.authorize_request(&headers, &Method::POST, "/api/compliance/check");
+        assert!(matches!(result, Err(AuthError::Forbidden { .. })));
+    }
+
+    #[test]
+    fn tenant_isolation_requires_tenant_scope() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+        settings.tenant_isolation_enabled = true;
+        settings.auth_api_keys = vec![AuthCredentialConfig {
+            label: None,
+            token: "tenant-token".to_string(),
+            role: "developer".to_string(),
+            scopes: vec!["check:invoke".to_string()],
+        }];
+
+        let service = AuthService::from_settings(&settings);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "tenant-token".parse().expect("header"));
+
+        let result = service.authorize_request(&headers, &Method::POST, "/api/compliance/check");
+        assert!(matches!(result, Err(AuthError::InvalidTenantScope { .. })));
+    }
+
+    #[test]
+    fn tenant_scope_is_attached_to_auth_context() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+        settings.tenant_isolation_enabled = true;
+        settings.tenant_require_workspace = true;
+        settings.auth_api_keys = vec![AuthCredentialConfig {
+            label: None,
+            token: "tenant-token".to_string(),
+            role: "developer".to_string(),
+            scopes: vec!["check:invoke".to_string()],
+        }];
+
+        let service = AuthService::from_settings(&settings);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "tenant-token".parse().expect("header"));
+        headers.insert("x-tenant-id", "tenant-a".parse().expect("header"));
+        headers.insert("x-workspace-id", "workspace-1".parse().expect("header"));
+
+        let result = service
+            .authorize_request(&headers, &Method::POST, "/api/compliance/check")
+            .expect("authorization should pass")
+            .expect("context should be present");
+
+        assert_eq!(result.tenant_scope.tenant_id.as_deref(), Some("tenant-a"));
+        assert_eq!(
+            result.tenant_scope.workspace_id.as_deref(),
+            Some("workspace-1")
+        );
+    }
+
+    #[test]
+    fn oidc_tenant_header_mismatch_is_denied() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+        settings.tenant_isolation_enabled = true;
+
+        let service = AuthService::from_settings_with_oidc_verifier(
+            &settings,
+            Some(Arc::new(StaticOidcVerifier {
+                principal: OidcPrincipal {
+                    subject: "user-1".to_string(),
+                    issuer: Some("https://issuer.example.com".to_string()),
+                    email: Some("user@example.com".to_string()),
+                    tenant_id: Some("tenant-claim".to_string()),
+                    provider: OidcProvider::Generic,
+                    roles: vec!["developer".to_string()],
+                    scopes: vec!["check:invoke".to_string()],
+                },
+            })),
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyIn0."
+                .parse()
+                .expect("header"),
+        );
+        headers.insert("x-tenant-id", "tenant-header".parse().expect("header"));
+
+        let result = service.authorize_request(&headers, &Method::POST, "/api/compliance/check");
+        assert!(matches!(result, Err(AuthError::InvalidTenantScope { .. })));
     }
 
     #[test]
@@ -1732,13 +2530,28 @@ mod tests {
             auth_rate_limit_per_minute: 60,
             auth_key_store_path: None,
             auth_default_key_expiry_secs: None,
+            mtls_enabled: false,
+            mtls_verified_header: "x-client-cert-verified".to_string(),
+            mtls_verified_value: "SUCCESS".to_string(),
+            mtls_subject_header: "x-client-cert-subject".to_string(),
+            mtls_fingerprint_header: "x-client-cert-fingerprint".to_string(),
+            mtls_allowed_subjects: vec![],
+            mtls_allowed_fingerprints: vec![],
+            mtls_role: "service_account".to_string(),
+            mtls_scopes: vec![],
+            tenant_isolation_enabled: false,
+            tenant_id_header: "x-tenant-id".to_string(),
+            workspace_id_header: "x-workspace-id".to_string(),
+            tenant_require_workspace: false,
+            tenant_quota_requests_per_minute: 0,
+            tenant_quota_max_concurrent_requests: 0,
             oidc_enabled: false,
             oidc_provider: "generic".to_string(),
             oidc_issuer_url: None,
             oidc_audience: None,
             oidc_client_id: None,
-            oidc_roles_claim: "roles".to_string(),
-            oidc_scopes_claim: "scope".to_string(),
+            oidc_roles_claim: "auto".to_string(),
+            oidc_scopes_claim: "auto".to_string(),
             oidc_jwks_url: None,
             oidc_jwks_refresh_interval_secs: 300,
             oidc_clock_skew_secs: 60,
