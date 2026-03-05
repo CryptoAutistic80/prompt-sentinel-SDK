@@ -7,9 +7,9 @@ Execution Mode: Phase-by-phase production hardening
 
 ## Current Stage Outcome
 
-This stage advanced **Phase 2 OAuth/OIDC signature-validation hardening** on top of the existing auth lifecycle work.
+This stage advanced **Phase 2 resource-level authorization scaffolding** by introducing project/environment-aware permission matching with backward-compatible global scope fallback.
 
-### Completed in this stage
+### Completed to date in this phase
 
 - Added credential lifecycle operations in auth service:
   - generate credential tokens
@@ -54,7 +54,20 @@ This stage advanced **Phase 2 OAuth/OIDC signature-validation hardening** on top
 - Added OIDC-focused tests:
   - JWT claims verifier behavior
   - auth service bearer-token authorization via pluggable verifier
+- Added durable auth access-event persistence:
+  - each allow/deny auth decision is now mirrored from `AuthService` into `AuditLogger`
+  - auth events are written as typed audit payloads (`event_type=auth_access`) for filtering/querying
+  - request `x-correlation-id` is now captured and propagated into auth audit events
+  - fallback correlation IDs are generated for auth events when the request has no correlation header
+- Wired server startup to inject the workflow audit logger into `AuthService` so protected endpoint auth events are durable by default.
+- Added auth unit test coverage proving auth access events are persisted into audit storage with expected payload shape.
 - Updated docs/examples (`README.md`, `.env.example`) for lifecycle endpoints and new env vars.
+- Added resource-level permission scaffold:
+  - optional request headers `x-project-id` and `x-environment` are normalized into auth resource scope
+  - permission evaluation now checks resource-aware candidates first (project+env, project-only, env-only) then global scope fallback
+  - both API key and OIDC bearer auth paths now include resource scope in `AuthContext`
+  - added tests for matching scope allow, mismatched scope deny, and global fallback behavior
+- Updated README with resource-scoped scope formats and header usage.
 
 ## Phase Status Dashboard
 
@@ -62,7 +75,7 @@ This stage advanced **Phase 2 OAuth/OIDC signature-validation hardening** on top
 |---|---|---|
 | Phase 0 - Foundation Hardening | In Progress | Core security/reliability foundations implemented; OTel/Sentry/chaos/contract testing remain. |
 | Phase 1 - Provider-Agnostic LLM Support | In Progress | Provider abstraction + backend switching implemented; routing/fallback/cost optimization pending. |
-| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation implemented; provider-specific onboarding/mTLS/multi-tenant isolation pending. |
+| Phase 2 - Enterprise Auth & Multi-Tenancy | In Progress | API key auth + RBAC + service accounts + rate limiting + key lifecycle + persistence + OIDC JWT/JWKS validation + durable auth access auditing + resource-level permission scaffold implemented; provider-specific onboarding/mTLS/multi-tenant isolation pending. |
 | Phase 3 - Comprehensive EU AI Act Coverage | In Progress | Baseline classification exists; full article-by-article depth pending. |
 | Phase 4 - Audit Trail & Evidence Management | In Progress | Existing audit trail and proofs active; v2 schema + advanced exports/retention lifecycle pending. |
 | Phase 5 - Configuration & Rules Management | In Progress | Env-driven config active; hot reload/staged rollout/rollback/policy-as-code pending. |
@@ -120,11 +133,11 @@ This stage advanced **Phase 2 OAuth/OIDC signature-validation hardening** on top
   - OIDC provider abstraction + bearer-token auth integration.
   - JWT signature verification via JWKS with refreshable key cache.
   - Auth access log retrieval.
+  - Durable auth access-event persistence into tamper-evident audit storage.
+  - Resource-level permission scaffold (project/environment-aware permission candidates + global fallback).
 - Remaining:
   - Provider-specific setup flows (Auth0/Okta/Azure AD/Keycloak).
   - mTLS auth support.
-  - Resource-level permissions.
-  - Access event audit expansion.
   - Full multi-tenant isolation and quotas.
 
 ## Validation
@@ -138,18 +151,11 @@ Commands run for this stage:
 ## Files Changed This Stage
 
 - `src/modules/auth/mod.rs`
-- `src/modules/auth/oidc.rs`
-- `src/config/settings.rs`
-- `src/server.rs`
-- `tests/multilingual_response_test.rs`
-- `Cargo.toml`
-- `Cargo.lock`
-- `.env.example`
 - `README.md`
 - `PROGRESS_SUMMARY.md`
 
 ## Next Execution Slice
 
-1. Persist auth access audit events into the main audit evidence layer (durable and queryable).
-2. Introduce resource-level permissions scaffold (project/environment dimension) as the first multi-tenant control.
-3. Add provider-specific OIDC onboarding profiles (Auth0/Okta/Azure AD/Keycloak) with tested claim mappings.
+1. Add provider-specific OIDC onboarding profiles (Auth0/Okta/Azure AD/Keycloak) with tested claim mappings.
+2. Add mTLS auth support for service-to-service deployments.
+3. Start multi-tenant isolation baseline (tenant/workspace identifiers + quota hooks).

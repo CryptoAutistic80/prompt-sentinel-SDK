@@ -18,6 +18,7 @@ use self::oidc::{
     OidcPrincipal, OidcTokenVerifier, OidcVerificationError, build_oidc_verifier, looks_like_jwt,
 };
 use crate::config::settings::{AppSettings, AuthCredentialConfig};
+use crate::modules::audit::logger::{AuditLogger, AuthAccessAuditEvent};
 
 const DEFAULT_ACCESS_LOG_LIMIT: usize = 200;
 const MAX_ACCESS_LOG_ENTRIES: usize = 5_000;
@@ -30,6 +31,13 @@ pub struct AuthContext {
     pub role: String,
     pub is_service_account: bool,
     pub scopes: Vec<String>,
+    pub resource_scope: ResourceScope,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResourceScope {
+    pub project_id: Option<String>,
+    pub environment: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +81,12 @@ impl CredentialEntry {
         self.scopes
             .iter()
             .any(|candidate| permission_match(candidate, permission))
+    }
+
+    fn has_any_permission(&self, permissions: &[String]) -> bool {
+        permissions
+            .iter()
+            .any(|permission| self.has_permission(permission))
     }
 
     fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
@@ -314,6 +328,7 @@ pub struct CredentialMetadata {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AccessAuditEvent {
+    pub correlation_id: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub principal_id: Option<String>,
     pub role: Option<String>,
@@ -356,6 +371,7 @@ pub struct AuthService {
     credentials: Arc<Mutex<HashMap<String, CredentialEntry>>>,
     rate_limiter: Option<RateLimiter>,
     access_events: Arc<Mutex<VecDeque<AccessAuditEvent>>>,
+    audit_logger: Option<AuditLogger>,
     credential_store: Option<CredentialStore>,
     default_key_expiry_secs: Option<u64>,
     oidc_verifier: Option<Arc<dyn OidcTokenVerifier + Send + Sync>>,
@@ -423,10 +439,16 @@ impl AuthService {
             credentials: Arc::new(Mutex::new(credentials)),
             rate_limiter,
             access_events: Arc::new(Mutex::new(VecDeque::new())),
+            audit_logger: None,
             credential_store,
             default_key_expiry_secs: settings.auth_default_key_expiry_secs,
             oidc_verifier,
         }
+    }
+
+    pub fn with_audit_logger(mut self, audit_logger: AuditLogger) -> Self {
+        self.audit_logger = Some(audit_logger);
+        self
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -443,13 +465,17 @@ impl AuthService {
             return Ok(None);
         }
 
-        let required_permission = required_permission(method, path).map(ToOwned::to_owned);
+        let resource_scope = extract_resource_scope(headers);
+        let required_permissions = required_permissions(method, path, &resource_scope);
+        let required_permission = required_permissions.first().cloned();
         let method_str = method.as_str().to_owned();
         let path_str = path.to_owned();
+        let correlation_id = extract_correlation_id(headers);
 
         let credentials = extract_credentials(headers);
         if credentials.api_key.is_none() && credentials.bearer.is_none() {
             self.record_access(AccessAuditEvent {
+                correlation_id: correlation_id.clone(),
                 timestamp: Utc::now(),
                 principal_id: None,
                 role: None,
@@ -464,7 +490,15 @@ impl AuthService {
 
         if let Some(token) = credentials.api_key {
             return self
-                .authorize_with_api_token(token, method, path, &required_permission)
+                .authorize_with_api_token(
+                    token,
+                    method,
+                    path,
+                    &resource_scope,
+                    &required_permissions,
+                    &required_permission,
+                    &correlation_id,
+                )
                 .map(Some);
         }
 
@@ -478,13 +512,24 @@ impl AuthService {
                         token,
                         method,
                         path,
+                        &resource_scope,
+                        &required_permissions,
                         &required_permission,
+                        &correlation_id,
                     )
                     .map(Some);
             }
 
             return self
-                .authorize_with_api_token(token, method, path, &required_permission)
+                .authorize_with_api_token(
+                    token,
+                    method,
+                    path,
+                    &resource_scope,
+                    &required_permissions,
+                    &required_permission,
+                    &correlation_id,
+                )
                 .map(Some);
         }
 
@@ -496,12 +541,16 @@ impl AuthService {
         token: &str,
         method: &Method,
         path: &str,
+        resource_scope: &ResourceScope,
+        required_permissions: &[String],
         required_permission: &Option<String>,
+        correlation_id: &Option<String>,
     ) -> Result<AuthContext, AuthError> {
         let token_hash = hash_token(token);
         let entry = {
             let Ok(guard) = self.credentials.lock() else {
                 self.record_access(AccessAuditEvent {
+                    correlation_id: correlation_id.clone(),
                     timestamp: Utc::now(),
                     principal_id: None,
                     role: None,
@@ -518,6 +567,7 @@ impl AuthService {
         }
         .ok_or_else(|| {
             self.record_access(AccessAuditEvent {
+                correlation_id: correlation_id.clone(),
                 timestamp: Utc::now(),
                 principal_id: None,
                 role: None,
@@ -532,6 +582,7 @@ impl AuthService {
 
         if entry.is_revoked() {
             self.record_access(AccessAuditEvent {
+                correlation_id: correlation_id.clone(),
                 timestamp: Utc::now(),
                 principal_id: Some(entry.key_id.clone()),
                 role: Some(entry.role.clone()),
@@ -546,6 +597,7 @@ impl AuthService {
 
         if entry.is_expired_at(Utc::now()) {
             self.record_access(AccessAuditEvent {
+                correlation_id: correlation_id.clone(),
                 timestamp: Utc::now(),
                 principal_id: Some(entry.key_id.clone()),
                 role: Some(entry.role.clone()),
@@ -562,6 +614,7 @@ impl AuthService {
             && !rate_limiter.allow(&entry.key_id)
         {
             self.record_access(AccessAuditEvent {
+                correlation_id: correlation_id.clone(),
                 timestamp: Utc::now(),
                 principal_id: Some(entry.key_id.clone()),
                 role: Some(entry.role.clone()),
@@ -574,10 +627,9 @@ impl AuthService {
             return Err(AuthError::RateLimited);
         }
 
-        if let Some(permission) = required_permission.as_deref()
-            && !entry.has_permission(permission)
-        {
+        if !required_permissions.is_empty() && !entry.has_any_permission(required_permissions) {
             self.record_access(AccessAuditEvent {
+                correlation_id: correlation_id.clone(),
                 timestamp: Utc::now(),
                 principal_id: Some(entry.key_id.clone()),
                 role: Some(entry.role.clone()),
@@ -585,14 +637,20 @@ impl AuthService {
                 path: path.to_owned(),
                 outcome: "deny_forbidden".to_string(),
                 required_permission: required_permission.clone(),
-                detail: Some(format!("missing required permission `{permission}`")),
+                detail: Some(format!(
+                    "missing required permission candidates: {}",
+                    required_permissions.join(", ")
+                )),
             });
             return Err(AuthError::Forbidden {
-                required_permission: permission.to_owned(),
+                required_permission: required_permission
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
             });
         }
 
         self.record_access(AccessAuditEvent {
+            correlation_id: correlation_id.clone(),
             timestamp: Utc::now(),
             principal_id: Some(entry.key_id.clone()),
             role: Some(entry.role.clone()),
@@ -600,7 +658,10 @@ impl AuthService {
             path: path.to_owned(),
             outcome: "allow".to_string(),
             required_permission: required_permission.clone(),
-            detail: Some("auth_mechanism=api_key".to_string()),
+            detail: Some(format!(
+                "auth_mechanism=api_key{}",
+                format_resource_scope_suffix(resource_scope)
+            )),
         });
 
         Ok(AuthContext {
@@ -608,6 +669,7 @@ impl AuthService {
             role: entry.role,
             is_service_account: entry.is_service_account,
             scopes: entry.scopes,
+            resource_scope: resource_scope.clone(),
         })
     }
 
@@ -617,7 +679,10 @@ impl AuthService {
         token: &str,
         method: &Method,
         path: &str,
+        resource_scope: &ResourceScope,
+        required_permissions: &[String],
         required_permission: &Option<String>,
+        correlation_id: &Option<String>,
     ) -> Result<AuthContext, AuthError> {
         let principal = verifier.verify(token).map_err(|error| {
             let auth_error = match error {
@@ -636,6 +701,7 @@ impl AuthService {
             };
 
             self.record_access(AccessAuditEvent {
+                correlation_id: correlation_id.clone(),
                 timestamp: Utc::now(),
                 principal_id: None,
                 role: None,
@@ -653,6 +719,7 @@ impl AuthService {
             && !rate_limiter.allow(&principal_id)
         {
             self.record_access(AccessAuditEvent {
+                correlation_id: correlation_id.clone(),
                 timestamp: Utc::now(),
                 principal_id: Some(principal_id),
                 role: Some(principal.primary_role().to_owned()),
@@ -665,10 +732,11 @@ impl AuthService {
             return Err(AuthError::RateLimited);
         }
 
-        if let Some(permission) = required_permission.as_deref()
-            && !principal_has_permission(&principal, permission)
+        if !required_permissions.is_empty()
+            && !principal_has_any_permission(&principal, required_permissions)
         {
             self.record_access(AccessAuditEvent {
+                correlation_id: correlation_id.clone(),
                 timestamp: Utc::now(),
                 principal_id: Some(format!("oidc_{}", principal.subject)),
                 role: Some(principal.primary_role().to_owned()),
@@ -676,14 +744,20 @@ impl AuthService {
                 path: path.to_owned(),
                 outcome: "deny_forbidden".to_string(),
                 required_permission: required_permission.clone(),
-                detail: Some(format!("missing required permission `{permission}`")),
+                detail: Some(format!(
+                    "missing required permission candidates: {}",
+                    required_permissions.join(", ")
+                )),
             });
             return Err(AuthError::Forbidden {
-                required_permission: permission.to_owned(),
+                required_permission: required_permission
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
             });
         }
 
         self.record_access(AccessAuditEvent {
+            correlation_id: correlation_id.clone(),
             timestamp: Utc::now(),
             principal_id: Some(format!("oidc_{}", principal.subject)),
             role: Some(principal.primary_role().to_owned()),
@@ -692,8 +766,9 @@ impl AuthService {
             outcome: "allow".to_string(),
             required_permission: required_permission.clone(),
             detail: Some(format!(
-                "auth_mechanism=oidc; provider={}",
-                verifier.provider().as_str()
+                "auth_mechanism=oidc; provider={}{}",
+                verifier.provider().as_str(),
+                format_resource_scope_suffix(resource_scope),
             )),
         });
 
@@ -702,6 +777,7 @@ impl AuthService {
             role: principal.primary_role().to_owned(),
             is_service_account: false,
             scopes: principal.scopes,
+            resource_scope: resource_scope.clone(),
         })
     }
 
@@ -934,13 +1010,31 @@ impl AuthService {
     }
 
     fn record_access(&self, event: AccessAuditEvent) {
-        let Ok(mut guard) = self.access_events.lock() else {
-            return;
-        };
+        if let Ok(mut guard) = self.access_events.lock() {
+            guard.push_back(event.clone());
+            while guard.len() > MAX_ACCESS_LOG_ENTRIES {
+                guard.pop_front();
+            }
+        } else {
+            warn!("Auth access event ring buffer lock poisoned");
+        }
 
-        guard.push_back(event);
-        while guard.len() > MAX_ACCESS_LOG_ENTRIES {
-            guard.pop_front();
+        if let Some(audit_logger) = &self.audit_logger {
+            let durable_event = AuthAccessAuditEvent {
+                correlation_id: event.correlation_id,
+                timestamp: event.timestamp,
+                principal_id: event.principal_id,
+                role: event.role,
+                method: event.method,
+                path: event.path,
+                outcome: event.outcome,
+                required_permission: event.required_permission,
+                detail: event.detail,
+            };
+
+            if let Err(error) = audit_logger.log_auth_access_event(durable_event) {
+                warn!("Failed to persist auth access event to audit storage: {error}");
+            }
         }
     }
 }
@@ -1033,6 +1127,97 @@ fn extract_credentials(headers: &HeaderMap) -> ExtractedCredentials<'_> {
     ExtractedCredentials { api_key, bearer }
 }
 
+fn extract_correlation_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-correlation-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn extract_resource_scope(headers: &HeaderMap) -> ResourceScope {
+    ResourceScope {
+        project_id: extract_resource_header(headers, "x-project-id"),
+        environment: extract_resource_header(headers, "x-environment"),
+    }
+}
+
+fn extract_resource_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(normalize_resource_segment)
+}
+
+fn normalize_resource_segment(raw: &str) -> Option<String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if normalized
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+    {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn format_resource_scope_suffix(resource_scope: &ResourceScope) -> String {
+    let mut parts = Vec::new();
+    if let Some(project_id) = resource_scope.project_id.as_deref() {
+        parts.push(format!("project={project_id}"));
+    }
+    if let Some(environment) = resource_scope.environment.as_deref() {
+        parts.push(format!("environment={environment}"));
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", parts.join("; "))
+    }
+}
+
+fn required_permissions(
+    method: &Method,
+    path: &str,
+    resource_scope: &ResourceScope,
+) -> Vec<String> {
+    let Some(base_permission) = required_permission(method, path) else {
+        return Vec::new();
+    };
+
+    let mut permissions = Vec::new();
+    if let (Some(project_id), Some(environment)) = (
+        resource_scope.project_id.as_deref(),
+        resource_scope.environment.as_deref(),
+    ) {
+        permissions.push(format!(
+            "{base_permission}:project:{project_id}:env:{environment}"
+        ));
+    }
+
+    if let Some(project_id) = resource_scope.project_id.as_deref() {
+        permissions.push(format!("{base_permission}:project:{project_id}"));
+    }
+
+    if let Some(environment) = resource_scope.environment.as_deref() {
+        permissions.push(format!("{base_permission}:env:{environment}"));
+    }
+
+    permissions.push(base_permission.to_string());
+
+    let mut seen = HashSet::new();
+    permissions
+        .into_iter()
+        .filter(|permission| seen.insert(permission.clone()))
+        .collect()
+}
+
 fn required_permission(method: &Method, path: &str) -> Option<&'static str> {
     match (method.as_str(), path) {
         ("POST", "/api/compliance/check") => Some("check:invoke"),
@@ -1089,6 +1274,15 @@ fn principal_has_permission(principal: &OidcPrincipal, required: &str) -> bool {
             .iter()
             .any(|candidate| permission_match(candidate, required))
     })
+}
+
+fn principal_has_any_permission(
+    principal: &OidcPrincipal,
+    required_permissions: &[String],
+) -> bool {
+    required_permissions
+        .iter()
+        .any(|required| principal_has_permission(principal, required))
 }
 
 fn hash_token(token: &str) -> String {
@@ -1177,6 +1371,8 @@ fn generate_unique_token(
 mod tests {
     use super::oidc::{OidcProvider, OidcTokenVerifier, OidcVerificationError};
     use super::*;
+    use crate::modules::audit::logger::AuditLogger;
+    use crate::modules::audit::storage::{AuditStorage, InMemoryAuditStorage};
     use std::sync::Arc;
 
     struct StaticOidcVerifier {
@@ -1206,6 +1402,77 @@ mod tests {
         assert!(limiter.allow("abc"));
         assert!(limiter.allow("abc"));
         assert!(!limiter.allow("abc"));
+    }
+
+    #[test]
+    fn resource_scoped_permission_allows_matching_project_environment() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+        settings.auth_api_keys = vec![AuthCredentialConfig {
+            label: None,
+            token: "resource-token".to_string(),
+            role: "developer".to_string(),
+            scopes: vec!["check:invoke:project:alpha:env:prod".to_string()],
+        }];
+
+        let service = AuthService::from_settings(&settings);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "resource-token".parse().expect("header"));
+        headers.insert("x-project-id", "alpha".parse().expect("header"));
+        headers.insert("x-environment", "prod".parse().expect("header"));
+
+        let result = service.authorize_request(&headers, &Method::POST, "/api/compliance/check");
+        let context = result
+            .expect("authorization should succeed")
+            .expect("auth context should exist");
+
+        assert_eq!(context.resource_scope.project_id.as_deref(), Some("alpha"));
+        assert_eq!(context.resource_scope.environment.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn resource_scoped_permission_denies_mismatched_environment() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+        settings.auth_api_keys = vec![AuthCredentialConfig {
+            label: None,
+            token: "resource-token".to_string(),
+            role: "developer".to_string(),
+            scopes: vec!["check:invoke:project:alpha:env:prod".to_string()],
+        }];
+
+        let service = AuthService::from_settings(&settings);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "resource-token".parse().expect("header"));
+        headers.insert("x-project-id", "alpha".parse().expect("header"));
+        headers.insert("x-environment", "staging".parse().expect("header"));
+
+        let result = service.authorize_request(&headers, &Method::POST, "/api/compliance/check");
+        assert!(matches!(result, Err(AuthError::Forbidden { .. })));
+    }
+
+    #[test]
+    fn global_permission_fallback_allows_resource_scoped_requests() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+        settings.auth_api_keys = vec![AuthCredentialConfig {
+            label: None,
+            token: "global-token".to_string(),
+            role: "developer".to_string(),
+            scopes: vec!["check:invoke".to_string()],
+        }];
+
+        let service = AuthService::from_settings(&settings);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "global-token".parse().expect("header"));
+        headers.insert("x-project-id", "alpha".parse().expect("header"));
+        headers.insert("x-environment", "prod".parse().expect("header"));
+
+        let result = service.authorize_request(&headers, &Method::POST, "/api/compliance/check");
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1407,6 +1674,40 @@ mod tests {
 
         assert_eq!(context.role, "developer");
         assert_eq!(context.principal_id, "oidc_user-1");
+    }
+
+    #[test]
+    fn access_events_are_mirrored_to_audit_storage() {
+        let mut settings = test_settings();
+        settings.auth_enabled = true;
+        settings.auth_api_keys = vec![AuthCredentialConfig {
+            label: None,
+            token: "durable-token".to_string(),
+            role: "compliance_admin".to_string(),
+            scopes: vec![],
+        }];
+
+        let storage = Arc::new(InMemoryAuditStorage::new());
+        let service = AuthService::from_settings(&settings)
+            .with_audit_logger(AuditLogger::new(storage.clone()));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "durable-token".parse().expect("header"));
+        headers.insert("x-correlation-id", "corr-auth-1".parse().expect("header"));
+
+        let result = service.authorize_request(&headers, &Method::POST, "/api/compliance/check");
+        assert!(result.is_ok());
+
+        let records = storage.all().expect("audit records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].correlation_id, "corr-auth-1");
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&records[0].payload).expect("valid auth audit payload");
+        assert_eq!(payload["event_type"], "auth_access");
+        assert_eq!(payload["event"]["outcome"], "allow");
+        assert_eq!(payload["event"]["method"], "POST");
+        assert_eq!(payload["event"]["path"], "/api/compliance/check");
     }
 
     fn test_settings() -> AppSettings {

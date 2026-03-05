@@ -267,6 +267,21 @@ Generate a new API credential. The plaintext `token` is returned only once.
 }
 ```
 
+### Resource-Scoped Permissions (Scaffold)
+
+Auth checks can now evaluate optional project/environment context from request headers:
+
+- `x-project-id: <project>`
+- `x-environment: <environment>`
+
+Scope examples:
+
+- `check:invoke:project:alpha:env:prod`
+- `check:invoke:project:alpha`
+- `check:invoke:env:staging`
+
+Global scopes such as `check:invoke` remain valid and act as a fallback.
+
 ### POST /api/auth/keys/rotate
 
 Rotate a credential without restarting the server.

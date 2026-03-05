@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 use super::proof::{AuditProof, chain_hash, hash_record};
 use super::storage::{AuditStorage, AuditStorageError, StoredAuditRecord};
@@ -48,6 +49,25 @@ pub struct AuditEvent {
     pub was_translated: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AuthAccessAuditEvent {
+    pub correlation_id: Option<String>,
+    pub timestamp: DateTime<Utc>,
+    pub principal_id: Option<String>,
+    pub role: Option<String>,
+    pub method: String,
+    pub path: String,
+    pub outcome: String,
+    pub required_permission: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TypedAuditPayload<T> {
+    event_type: String,
+    event: T,
+}
+
 #[derive(Clone)]
 pub struct AuditLogger {
     storage: Arc<dyn AuditStorage>,
@@ -59,7 +79,32 @@ impl AuditLogger {
     }
 
     pub fn log_event(&self, event: AuditEvent) -> Result<AuditProof, AuditError> {
+        let correlation_id = event.correlation_id.clone();
         let payload = serde_json::to_string(&event)?;
+        self.append_payload(correlation_id, Utc::now(), payload)
+    }
+
+    pub fn log_auth_access_event(
+        &self,
+        event: AuthAccessAuditEvent,
+    ) -> Result<AuditProof, AuditError> {
+        let correlation_id = normalize_correlation_id(event.correlation_id.clone())
+            .unwrap_or_else(|| format!("auth-{}", Uuid::new_v4().simple()));
+        let timestamp = event.timestamp;
+        let payload = serde_json::to_string(&TypedAuditPayload {
+            event_type: "auth_access".to_string(),
+            event,
+        })?;
+
+        self.append_payload(correlation_id, timestamp, payload)
+    }
+
+    fn append_payload(
+        &self,
+        correlation_id: String,
+        timestamp: DateTime<Utc>,
+        payload: String,
+    ) -> Result<AuditProof, AuditError> {
         let record_hash = hash_record(&payload);
         let previous_chain = self.storage.latest_chain_hash()?;
         let chain_hash = chain_hash(previous_chain.as_deref(), &record_hash);
@@ -71,8 +116,8 @@ impl AuditLogger {
         };
 
         let record = StoredAuditRecord {
-            correlation_id: event.correlation_id,
-            timestamp: Utc::now(),
+            correlation_id,
+            timestamp,
             payload,
             proof: proof.clone(),
         };
@@ -88,6 +133,17 @@ impl AuditLogger {
     pub fn storage(&self) -> &Arc<dyn AuditStorage> {
         &self.storage
     }
+}
+
+fn normalize_correlation_id(raw: Option<String>) -> Option<String> {
+    raw.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 #[derive(Debug, Error)]

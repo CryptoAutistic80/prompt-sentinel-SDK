@@ -182,7 +182,9 @@ pub struct PromptSentinelServer {
 impl PromptSentinelServer {
     /// Create a new server instance
     pub fn new(config: AppSettings, engine: ComplianceEngine) -> Self {
-        let auth_service = Arc::new(AuthService::from_settings(&config));
+        let auth_service = Arc::new(
+            AuthService::from_settings(&config).with_audit_logger(engine.audit_logger().clone()),
+        );
         Self {
             config,
             state: AppState {
