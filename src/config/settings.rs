@@ -86,6 +86,8 @@ pub struct AppSettings {
     pub tenant_policy_overlays_strict: bool,
     pub audit_storage_policy_path: String,
     pub audit_storage_policy_strict: bool,
+    pub residency_enforcement_enabled: bool,
+    pub deployment_region: String,
     pub oidc_enabled: bool,
     pub oidc_provider: String,
     pub oidc_issuer_url: Option<String>,
@@ -209,6 +211,9 @@ impl AppSettings {
             audit_storage_policy_path: env::var("AUDIT_STORAGE_POLICY_PATH")
                 .unwrap_or_else(|_| "config/audit_storage_policies.json".to_string()),
             audit_storage_policy_strict: parse_env_bool("AUDIT_STORAGE_POLICY_STRICT", false),
+            residency_enforcement_enabled: parse_env_bool("RESIDENCY_ENFORCEMENT_ENABLED", false),
+            deployment_region: env::var("DEPLOYMENT_REGION")
+                .unwrap_or_else(|_| "global".to_string()),
             oidc_enabled: parse_env_bool("OIDC_ENABLED", false),
             oidc_provider: env::var("OIDC_PROVIDER").unwrap_or_else(|_| "generic".to_string()),
             oidc_issuer_url: parse_env_optional_string("OIDC_ISSUER_URL"),

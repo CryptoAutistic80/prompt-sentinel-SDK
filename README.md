@@ -118,6 +118,8 @@ docker run -d \
 | `TENANT_POLICY_OVERLAYS_STRICT` | Fail startup if overlay file is unreadable/invalid | `false` |
 | `AUDIT_STORAGE_POLICY_PATH` | JSON file containing audit residency/retention policy overlays | `config/audit_storage_policies.json` |
 | `AUDIT_STORAGE_POLICY_STRICT` | Fail startup if audit storage policy file is unreadable/invalid | `false` |
+| `RESIDENCY_ENFORCEMENT_ENABLED` | Fail-closed tenant residency guard during request processing | `false` |
+| `DEPLOYMENT_REGION` | Region label for current deployment | `global` |
 | `OIDC_ENABLED` | Enable OIDC bearer-token verification path | `false` |
 | `OIDC_PROVIDER` | `generic`, `auth0`, `okta`, `azure_ad`, `keycloak` | `generic` |
 | `OIDC_ISSUER_URL` | Expected JWT issuer (`iss`) | None |
@@ -363,6 +365,7 @@ Audit trail policy controls:
 - Every persisted audit record now includes tenant/workspace identifiers and resolved residency/storage metadata.
 - `POST /api/audit/trail` supports filters: `tenant_id`, `workspace_id`, `data_region`, `storage_policy` (in addition to correlation/time filters).
 - Authenticated tenant-scoped callers are forced to their own tenant/workspace filters on audit queries.
+- When `RESIDENCY_ENFORCEMENT_ENABLED=true`, request processing fails closed if tenant residency policy region does not match `DEPLOYMENT_REGION`.
 
 ### POST /api/auth/keys/rotate
 

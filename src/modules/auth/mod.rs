@@ -2552,6 +2552,8 @@ mod tests {
             tenant_policy_overlays_strict: false,
             audit_storage_policy_path: "config/audit_storage_policies.json".to_string(),
             audit_storage_policy_strict: false,
+            residency_enforcement_enabled: false,
+            deployment_region: "global".to_string(),
             oidc_enabled: false,
             oidc_provider: "generic".to_string(),
             oidc_issuer_url: None,

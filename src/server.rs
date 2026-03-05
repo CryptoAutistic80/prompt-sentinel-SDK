@@ -14,6 +14,7 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json;
+use thiserror::Error;
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing::{debug, error, info, warn};
@@ -60,9 +61,69 @@ pub struct AppState {
     pub startup_complete: Arc<AtomicBool>,
     pub auth_service: Arc<AuthService>,
     pub tenant_quota_manager: Option<Arc<TenantQuotaManager>>,
+    pub residency_guard: Option<Arc<ResidencyGuard>>,
 }
 
 const QUOTA_WINDOW_MILLIS: i64 = 60_000;
+
+#[derive(Clone)]
+pub struct ResidencyGuard {
+    deployment_region: String,
+    policy_resolver: AuditStoragePolicyResolver,
+}
+
+impl ResidencyGuard {
+    fn from_settings(
+        settings: &AppSettings,
+        policy_resolver: AuditStoragePolicyResolver,
+    ) -> Option<Self> {
+        if !settings.residency_enforcement_enabled {
+            return None;
+        }
+
+        Some(Self {
+            deployment_region: settings.deployment_region.trim().to_string(),
+            policy_resolver,
+        })
+    }
+
+    fn enforce(
+        &self,
+        tenant_id: Option<&str>,
+        workspace_id: Option<&str>,
+    ) -> Result<crate::modules::audit::policy::AuditStoragePolicy, ResidencyEnforcementError> {
+        let resolved_policy = self.policy_resolver.resolve(tenant_id, workspace_id);
+        let Some(required_region) = resolved_policy.data_region.as_deref() else {
+            return Ok(resolved_policy);
+        };
+
+        if required_region.eq_ignore_ascii_case("global") {
+            return Ok(resolved_policy);
+        }
+
+        let deployment_region = self.deployment_region.trim();
+        if deployment_region.is_empty() {
+            return Err(ResidencyEnforcementError::MissingDeploymentRegion);
+        }
+
+        if !required_region.eq_ignore_ascii_case(deployment_region) {
+            return Err(ResidencyEnforcementError::DeploymentRegionMismatch {
+                required: required_region.to_string(),
+                actual: deployment_region.to_string(),
+            });
+        }
+
+        Ok(resolved_policy)
+    }
+}
+
+#[derive(Debug, Error)]
+enum ResidencyEnforcementError {
+    #[error("deployment region is not configured for residency enforcement")]
+    MissingDeploymentRegion,
+    #[error("tenant residency requires region `{required}` but deployment region is `{actual}`")]
+    DeploymentRegionMismatch { required: String, actual: String },
+}
 
 #[derive(Clone)]
 pub struct TenantQuotaManager {
@@ -622,7 +683,11 @@ pub struct PromptSentinelServer {
 
 impl PromptSentinelServer {
     /// Create a new server instance
-    pub fn new(config: AppSettings, engine: ComplianceEngine) -> Self {
+    pub fn new(
+        config: AppSettings,
+        engine: ComplianceEngine,
+        residency_guard: Option<Arc<ResidencyGuard>>,
+    ) -> Self {
         let auth_service = Arc::new(
             AuthService::from_settings(&config).with_audit_logger(engine.audit_logger().clone()),
         );
@@ -634,6 +699,7 @@ impl PromptSentinelServer {
                 startup_complete: Arc::new(AtomicBool::new(true)),
                 auth_service,
                 tenant_quota_manager,
+                residency_guard,
             },
         }
     }
@@ -1015,7 +1081,8 @@ async fn get_audit_trail(
     debug!("Received audit trail request");
 
     if let Some(Extension(context)) = auth_context
-        && let Err(detail) = enforce_audit_query_scope(&mut request, &context)
+        && let Err(detail) =
+            enforce_audit_query_scope(&mut request, &context, state.residency_guard.as_deref())
     {
         get_metrics().increment_errors("audit_scope");
         return Err((StatusCode::FORBIDDEN, detail));
@@ -1042,6 +1109,7 @@ async fn get_audit_trail(
 fn enforce_audit_query_scope(
     request: &mut AuditTrailRequest,
     auth_context: &AuthContext,
+    residency_guard: Option<&ResidencyGuard>,
 ) -> Result<(), String> {
     let context_tenant = auth_context.tenant_scope.tenant_id.as_deref();
     let context_workspace = auth_context.tenant_scope.workspace_id.as_deref();
@@ -1064,6 +1132,37 @@ fn enforce_audit_query_scope(
                 );
             }
             request.workspace_id = Some(context_workspace.to_string());
+        }
+    }
+
+    if let Some(residency_guard) = residency_guard {
+        let resolved_policy = residency_guard
+            .enforce(
+                request.tenant_id.as_deref(),
+                request.workspace_id.as_deref(),
+            )
+            .map_err(|error| format!("audit query blocked by residency policy: {error}"))?;
+
+        if let Some(required_region) = resolved_policy.data_region {
+            if let Some(request_region) = request.data_region.as_deref()
+                && !request_region.eq_ignore_ascii_case(required_region.as_str())
+            {
+                return Err(
+                    "audit query data region does not match tenant residency policy".to_string(),
+                );
+            }
+            request.data_region = Some(required_region);
+        }
+
+        if let Some(required_storage_policy) = resolved_policy.storage_policy {
+            if let Some(request_storage_policy) = request.storage_policy.as_deref()
+                && !request_storage_policy.eq_ignore_ascii_case(required_storage_policy.as_str())
+            {
+                return Err(
+                    "audit query storage policy does not match tenant residency policy".to_string(),
+                );
+            }
+            request.storage_policy = Some(required_storage_policy);
         }
     }
 
@@ -1122,6 +1221,16 @@ async fn check_compliance(
     if let Some(Extension(context)) = auth_context {
         request.tenant_id = context.tenant_scope.tenant_id;
         request.workspace_id = context.tenant_scope.workspace_id;
+    }
+
+    if let Some(residency_guard) = state.residency_guard.as_deref()
+        && let Err(error) = residency_guard.enforce(
+            request.tenant_id.as_deref(),
+            request.workspace_id.as_deref(),
+        )
+    {
+        get_metrics().increment_errors("residency");
+        return Err((StatusCode::FORBIDDEN, error.to_string()));
     }
 
     state
@@ -1200,6 +1309,8 @@ impl FrameworkConfig {
             tenant_policy_overlays_strict: false,
             audit_storage_policy_path: "config/audit_storage_policies.json".to_string(),
             audit_storage_policy_strict: false,
+            residency_enforcement_enabled: false,
+            deployment_region: "global".to_string(),
             oidc_enabled: false,
             oidc_provider: "generic".to_string(),
             oidc_issuer_url: None,
@@ -1296,6 +1407,9 @@ impl FrameworkConfig {
                 AuditStoragePolicyResolver::default()
             }
         };
+        let residency_guard =
+            ResidencyGuard::from_settings(&settings, audit_storage_policy_resolver.clone())
+                .map(Arc::new);
 
         let audit_storage: Arc<dyn AuditStorage> =
             Arc::new(SledAuditStorage::new(&self.sled_db_path)?);
@@ -1383,13 +1497,14 @@ impl FrameworkConfig {
         )
         .with_tenant_policy_resolver(tenant_policy_resolver);
 
-        Ok(PromptSentinelServer::new(settings, engine))
+        Ok(PromptSentinelServer::new(settings, engine, residency_guard))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::auth::ResourceScope;
     use std::thread::sleep;
 
     #[test]
@@ -1507,5 +1622,182 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(db_path);
+    }
+
+    #[test]
+    fn residency_guard_allows_matching_region() {
+        let policy_path = write_temp_audit_policy(
+            r#"{
+                "default": { "data_region": "global", "storage_policy": "standard", "retention_days": 365 },
+                "tenants": {
+                    "tenant-a": { "data_region": "eu-west-1", "storage_policy": "eu_restricted", "retention_days": 730 }
+                }
+            }"#,
+        );
+
+        let resolver = AuditStoragePolicyResolver::from_file(
+            policy_path
+                .to_str()
+                .expect("policy path should be valid UTF-8"),
+        )
+        .expect("policy resolver");
+        let guard = ResidencyGuard {
+            deployment_region: "eu-west-1".to_string(),
+            policy_resolver: resolver,
+        };
+
+        let result = guard.enforce(Some("tenant-a"), None);
+        assert!(result.is_ok(), "expected residency policy to allow request");
+
+        let _ = std::fs::remove_file(policy_path);
+    }
+
+    #[test]
+    fn residency_guard_blocks_mismatched_region() {
+        let policy_path = write_temp_audit_policy(
+            r#"{
+                "default": { "data_region": "global", "storage_policy": "standard", "retention_days": 365 },
+                "tenants": {
+                    "tenant-a": { "data_region": "eu-west-1", "storage_policy": "eu_restricted", "retention_days": 730 }
+                }
+            }"#,
+        );
+
+        let resolver = AuditStoragePolicyResolver::from_file(
+            policy_path
+                .to_str()
+                .expect("policy path should be valid UTF-8"),
+        )
+        .expect("policy resolver");
+        let guard = ResidencyGuard {
+            deployment_region: "us-east-1".to_string(),
+            policy_resolver: resolver,
+        };
+
+        assert!(matches!(
+            guard.enforce(Some("tenant-a"), None),
+            Err(ResidencyEnforcementError::DeploymentRegionMismatch { .. })
+        ));
+
+        let _ = std::fs::remove_file(policy_path);
+    }
+
+    #[test]
+    fn audit_query_scope_pins_region_and_storage_policy() {
+        let policy_path = write_temp_audit_policy(
+            r#"{
+                "default": { "data_region": "global", "storage_policy": "standard", "retention_days": 365 },
+                "tenants": {
+                    "tenant-a": { "data_region": "eu-west-1", "storage_policy": "eu_restricted", "retention_days": 730 }
+                }
+            }"#,
+        );
+        let resolver = AuditStoragePolicyResolver::from_file(
+            policy_path
+                .to_str()
+                .expect("policy path should be valid UTF-8"),
+        )
+        .expect("policy resolver");
+        let guard = ResidencyGuard {
+            deployment_region: "eu-west-1".to_string(),
+            policy_resolver: resolver,
+        };
+
+        let auth_context = AuthContext {
+            principal_id: "principal".to_string(),
+            role: "developer".to_string(),
+            is_service_account: false,
+            scopes: vec!["audit:read".to_string()],
+            tenant_scope: TenantScope {
+                tenant_id: Some("tenant-a".to_string()),
+                workspace_id: None,
+            },
+            resource_scope: ResourceScope::default(),
+        };
+
+        let mut request = AuditTrailRequest {
+            limit: Some(10),
+            offset: Some(0),
+            start_time: None,
+            end_time: None,
+            correlation_id: None,
+            tenant_id: None,
+            workspace_id: None,
+            data_region: None,
+            storage_policy: None,
+        };
+
+        let result = enforce_audit_query_scope(&mut request, &auth_context, Some(&guard));
+        assert!(result.is_ok(), "expected scoped audit query to pass");
+        assert_eq!(request.tenant_id.as_deref(), Some("tenant-a"));
+        assert_eq!(request.data_region.as_deref(), Some("eu-west-1"));
+        assert_eq!(request.storage_policy.as_deref(), Some("eu_restricted"));
+
+        let _ = std::fs::remove_file(policy_path);
+    }
+
+    #[test]
+    fn audit_query_scope_rejects_conflicting_region_filter() {
+        let policy_path = write_temp_audit_policy(
+            r#"{
+                "default": { "data_region": "global", "storage_policy": "standard", "retention_days": 365 },
+                "tenants": {
+                    "tenant-a": { "data_region": "eu-west-1", "storage_policy": "eu_restricted", "retention_days": 730 }
+                }
+            }"#,
+        );
+        let resolver = AuditStoragePolicyResolver::from_file(
+            policy_path
+                .to_str()
+                .expect("policy path should be valid UTF-8"),
+        )
+        .expect("policy resolver");
+        let guard = ResidencyGuard {
+            deployment_region: "eu-west-1".to_string(),
+            policy_resolver: resolver,
+        };
+
+        let auth_context = AuthContext {
+            principal_id: "principal".to_string(),
+            role: "developer".to_string(),
+            is_service_account: false,
+            scopes: vec!["audit:read".to_string()],
+            tenant_scope: TenantScope {
+                tenant_id: Some("tenant-a".to_string()),
+                workspace_id: None,
+            },
+            resource_scope: ResourceScope::default(),
+        };
+
+        let mut request = AuditTrailRequest {
+            limit: Some(10),
+            offset: Some(0),
+            start_time: None,
+            end_time: None,
+            correlation_id: None,
+            tenant_id: Some("tenant-a".to_string()),
+            workspace_id: None,
+            data_region: Some("us-east-1".to_string()),
+            storage_policy: None,
+        };
+
+        let result = enforce_audit_query_scope(&mut request, &auth_context, Some(&guard));
+        assert!(result.is_err());
+        assert!(
+            result
+                .expect_err("expected conflict")
+                .contains("data region")
+        );
+
+        let _ = std::fs::remove_file(policy_path);
+    }
+
+    fn write_temp_audit_policy(payload: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "prompt_sentinel_audit_policy_{}.json",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::write(&path, payload).expect("write policy file");
+        path
     }
 }
